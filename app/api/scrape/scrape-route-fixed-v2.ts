@@ -20,6 +20,18 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Vérification d'identité EN PREMIER : on ne lance jamais Playwright
+  // (coûteux en CPU/RAM, donc en argent sur Railway) pour un appel non authentifié.
+  const supabase = await getSupabaseServer();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return NextResponse.json({ error: "Non authentifié." }, { status: 401 });
+  }
+
   let listings;
   try {
     listings = await scrapeGoogleMaps(query, zone, maxResults);
@@ -39,16 +51,6 @@ export async function POST(req: NextRequest) {
       { inserted: 0, message: "Aucun résultat trouvé pour cette recherche." },
       { status: 200 }
     );
-  }
-
-  const supabase = await getSupabaseServer();
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    return NextResponse.json({ error: "Non authentifié." }, { status: 401 });
   }
 
   const rows = listings.map((l) => {
