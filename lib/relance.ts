@@ -18,3 +18,21 @@ export function nextRelanceDate(stage: number, from: Date = new Date()): Date {
 export function toDateInputValue(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
+
+// Traduit next_relance_date/status en indication lisible ("à relancer
+// aujourd'hui", "en retard de 3 j", "relance dans 2 j"), pour que le
+// tableau vive dans le temps sans colonne supplémentaire en base.
+export function relanceHint(
+  status: string,
+  nextRelanceDate: string | null
+): string | null {
+  if (status !== "a_relancer" || !nextRelanceDate) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const target = new Date(nextRelanceDate);
+  const diffDays = Math.round((target.getTime() - today.getTime()) / 86_400_000);
+
+  if (diffDays < 0) return `En retard de ${Math.abs(diffDays)} j`;
+  if (diffDays === 0) return "À relancer aujourd'hui";
+  return `Relance dans ${diffDays} j`;
+}

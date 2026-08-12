@@ -2,10 +2,10 @@ import Link from "next/link";
 import SignOutButton from "./SignOutButton";
 
 const links = [
-  { href: "/dashboard", label: "Prospects" },
-  { href: "/dashboard/relances", label: "Relances" },
-  { href: "/dashboard/nouvelle-recherche", label: "Nouvelle recherche" },
-  { href: "/dashboard/progression", label: "Progression" },
+  { href: "/dashboard", label: "Dashboard" },
+  { href: "/dashboard/tableau", label: "Tableau" },
+  { href: "/dashboard/relance", label: "Relance" },
+  { href: "/dashboard/recherche", label: "Recherche" },
 ];
 
 export default function DashboardNav() {

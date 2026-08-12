@@ -6,6 +6,17 @@
   scroll-behavior: smooth;
 }
 
+/* Scrollbar de la page masquée pour rester dans l'esthétique épurée du
+   site — le scroll (molette, clavier, tactile) reste actif. */
+html {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar {
+  display: none;
+}
+
 body {
   font-feature-settings: "ss01" 1;
 }
@@ -24,6 +35,17 @@ body {
 
 .btn-ghost {
   @apply inline-flex items-center gap-2 border border-ink/25 text-text-ink font-mono text-sm tracking-wide uppercase px-6 py-3.5 transition-colors hover:border-ink hover:bg-ink hover:text-text-paper focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink;
+}
+
+/* Scroll toujours actif (molette, clavier, tactile), juste la barre
+   visuelle masquée — utilisé sur la fiche prospect sticky. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

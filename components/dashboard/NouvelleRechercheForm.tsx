@@ -31,6 +31,11 @@ export default function NouvelleRechercheForm() {
         return;
       }
 
+      if (data.tableauId) {
+        router.push(`/dashboard/tableau/${data.tableauId}`);
+        return;
+      }
+
       setResult(
         `${data.inserted} prospect${data.inserted > 1 ? "s" : ""} enregistré${
           data.inserted > 1 ? "s" : ""

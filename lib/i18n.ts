@@ -14,15 +14,15 @@ export const dictionary = {
       titleLine2: "tes clients.",
       titleLine3: "Traque-les.",
       subtitle:
-        "TRAQUE scanne votre zone de chalandise, note chaque prospect selon son potentiel, prépare l'approche et déclenche les relances au bon moment. Vous, vous passez l'appel.",
+        "TRAQUE scanne votre zone de chalandise, récupère les coordonnées et la réputation en ligne de chaque prospect, prépare des messages d'approche prêts à l'emploi et déclenche les relances au bon moment. Vous, vous passez l'appel.",
       ctaPrimary: "Essayer gratuitement",
       ctaSecondary: "Voir comment ça marche",
     },
     radar: {
       sector: "Secteur — Occitanie",
       scanning: "scan actif",
-      level: "Niveau 3 — Chasseur confirmé",
-      points: "640 / 900 pts",
+      level: "Streak en cours",
+      points: "🔥 12 jours d'affilée",
     },
     problem: {
       eyebrow: "Le constat",
@@ -41,13 +41,13 @@ export const dictionary = {
         },
         {
           n: "02",
-          title: "Scoring",
-          text: "Chaque prospect reçoit une note d'opportunité, pour repérer en un coup d'œil les cibles qui valent l'appel.",
+          title: "Enrichissement",
+          text: "Chaque fiche est complétée avec adresse, site web, note Google et nombre d'avis, pour juger d'un coup d'œil qui vaut l'appel.",
         },
         {
           n: "03",
           title: "Approche",
-          text: "Un angle et un pitch personnalisés sont générés pour chaque prospect, prêts à être adaptés en quelques secondes.",
+          text: "Plusieurs messages de prospection sont générés selon le profil du prospect (note, avis, présence en ligne), prêts à copier pour l'appel, le SMS ou l'email.",
         },
         {
           n: "04",
@@ -56,8 +56,8 @@ export const dictionary = {
         },
         {
           n: "05",
-          title: "Progression",
-          text: "Chaque action rapporte des points. Les paliers marquent la montée en compétence, appel après appel.",
+          title: "Suivi",
+          text: "Un dashboard affiche le pipeline en temps réel (contactés, taux de conversion) et un streak quotidien garde le rythme, jour après jour.",
         },
       ],
     },
@@ -71,29 +71,29 @@ export const dictionary = {
         },
         {
           title: "Fiche prospect",
-          text: "Nom, secteur, note d'opportunité et angle d'approche réunis sur une seule fiche, pensée pour être lue juste avant l'appel.",
+          text: "Nom, secteur, coordonnées complètes, note Google et avis réunis sur une seule fiche, pensée pour être lue juste avant l'appel.",
         },
         {
           title: "File de relance",
           text: "Une liste triée par urgence, mise à jour seule, pour savoir qui rappeler aujourd'hui sans tenir un tableau à part.",
         },
         {
-          title: "Historique d'appels",
-          text: "Chaque échange est noté au même endroit, pour retrouver en un clic où en est une conversation entamée.",
+          title: "Dashboard & streak",
+          text: "Le pipeline en un coup d'œil (contactés, taux de conversion) et un streak quotidien pour garder le rythme de prospection.",
         },
       ],
     },
     gamification: {
       eyebrow: "Progression",
       titleLine1: "La prospection à froid, en solo, use.",
-      titleLine2: "La progression, ça motive.",
+      titleLine2: "La régularité, ça motive.",
       subtitle:
-        "Sourcer une fiche, décrocher, obtenir un rendez-vous : chaque action rapporte des points. Les paliers marquent une vraie montée en compétence, pas un gadget — de quoi garder le rythme sur la durée.",
+        "Chaque changement de statut compte pour la journée. Le streak garde une trace des jours consécutifs où vous avez avancé, et le dashboard résume où en est votre pipeline — de quoi tenir le rythme sur la durée, pas juste un jour de motivation.",
       levels: [
-        { rank: "01", title: "Éclaireur", detail: "Premiers prospects sourcés" },
-        { rank: "02", title: "Traqueur", detail: "Premiers rendez-vous décrochés" },
-        { rank: "03", title: "Chasseur confirmé", detail: "Cadence de relance tenue" },
-        { rank: "04", title: "Tête de meute", detail: "Portefeuille en croissance régulière" },
+        { rank: "01", title: "Streak quotidien", detail: "Un jour compte dès la première action de prospection" },
+        { rank: "02", title: "File de relance", detail: "Les prospects dus remontent automatiquement, tous tableaux confondus" },
+        { rank: "03", title: "Pipeline en direct", detail: "Contactés, vendus et taux de conversion, mis à jour en continu" },
+        { rank: "04", title: "Répartition par statut", detail: "Voir en un coup d'œil où ça avance et où ça coince" },
       ],
     },
     waitlist: {
@@ -120,15 +120,15 @@ export const dictionary = {
       titleLine2: "your clients.",
       titleLine3: "Track them down.",
       subtitle:
-        "TRAQUE scans your target area, scores each prospect by potential, drafts the approach, and triggers follow-ups at the right time. You just make the call.",
+        "TRAQUE scans your target area, pulls each prospect's contact details and online reputation, drafts ready-to-use outreach messages, and triggers follow-ups at the right time. You just make the call.",
       ctaPrimary: "Try it free",
       ctaSecondary: "See how it works",
     },
     radar: {
       sector: "Sector — Occitanie",
       scanning: "scanning",
-      level: "Level 3 — Seasoned hunter",
-      points: "640 / 900 pts",
+      level: "Streak in progress",
+      points: "🔥 12 days in a row",
     },
     problem: {
       eyebrow: "The problem",
@@ -147,13 +147,13 @@ export const dictionary = {
         },
         {
           n: "02",
-          title: "Scoring",
-          text: "Every prospect gets an opportunity score, so you can spot at a glance which ones are worth the call.",
+          title: "Enrichment",
+          text: "Every sheet is completed with address, website, Google rating and review count, so you can judge at a glance who's worth the call.",
         },
         {
           n: "03",
           title: "Approach",
-          text: "A personalized angle and pitch are generated for each prospect, ready to adapt in seconds.",
+          text: "Several outreach messages are generated based on the prospect's profile (rating, reviews, online presence), ready to copy for a call, text, or email.",
         },
         {
           n: "04",
@@ -162,8 +162,8 @@ export const dictionary = {
         },
         {
           n: "05",
-          title: "Progression",
-          text: "Every action earns points. Levels mark your progress, call after call.",
+          title: "Tracking",
+          text: "A dashboard shows your pipeline in real time (contacted, conversion rate), and a daily streak keeps the pace going, day after day.",
         },
       ],
     },
@@ -177,29 +177,29 @@ export const dictionary = {
         },
         {
           title: "Prospect sheet",
-          text: "Name, sector, opportunity score and approach angle on one sheet, built to be read right before the call.",
+          text: "Name, sector, full contact details, Google rating and reviews on one sheet, built to be read right before the call.",
         },
         {
           title: "Follow-up queue",
           text: "A list sorted by urgency, updated on its own, so you know who to call back today without keeping a separate sheet.",
         },
         {
-          title: "Call history",
-          text: "Every exchange is logged in the same place, so you can see where a conversation stands in one click.",
+          title: "Dashboard & streak",
+          text: "Your pipeline at a glance (contacted, conversion rate) and a daily streak to keep the pace of your prospecting.",
         },
       ],
     },
     gamification: {
       eyebrow: "Progression",
       titleLine1: "Cold prospecting solo wears you down.",
-      titleLine2: "Progression keeps you going.",
+      titleLine2: "Consistency keeps you going.",
       subtitle:
-        "Sourcing a lead, making the call, landing a meeting: every action earns points. Levels mark real skill progression, not a gimmick — something to keep the pace over time.",
+        "Every status change counts for the day. The streak tracks consecutive days you kept moving, and the dashboard sums up where your pipeline stands — something to keep the pace over time, not just one day of motivation.",
       levels: [
-        { rank: "01", title: "Scout", detail: "First prospects sourced" },
-        { rank: "02", title: "Tracker", detail: "First meetings booked" },
-        { rank: "03", title: "Seasoned hunter", detail: "Follow-up cadence kept" },
-        { rank: "04", title: "Pack leader", detail: "Portfolio growing steadily" },
+        { rank: "01", title: "Daily streak", detail: "A day counts as soon as you log one action" },
+        { rank: "02", title: "Follow-up queue", detail: "Due prospects surface automatically, across every search" },
+        { rank: "03", title: "Live pipeline", detail: "Contacted, closed, and conversion rate, updated as you work" },
+        { rank: "04", title: "Status breakdown", detail: "See at a glance what's moving and what's stuck" },
       ],
     },
     waitlist: {

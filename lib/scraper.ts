@@ -1,24 +1,40 @@
-import { chromium } from "playwright";
+import { chromium, type BrowserContext, type Page } from "playwright";
 
-// Scraper Google Maps — approche directe (pas d'API officielle).
+// Scraper Google Maps — moteur de découverte incrémentale.
 //
-// ATTENTION, à lire avant de t'en servir :
-// - Ceci est contraire aux Conditions Générales d'Utilisation de Google.
-//   Usage à tes risques : blocage d'IP possible, CAPTCHA, ou pire.
-// - Les sélecteurs CSS de Google Maps changent régulièrement (classes
-//   générées/obfusquées). J'ai privilégié partout où possible des
-//   attributs plus stables (`data-item-id`, `role`), mais si le scraper
-//   ne remonte plus rien, c'est probablement qu'un sélecteur a changé —
-//   ouvre Google Maps, clic droit > Inspecter sur l'élément concerné, et
-//   ajuste le sélecteur ici.
-// - Reste raisonnable sur `maxResults` et la fréquence des recherches
-//   pour limiter le risque de blocage.
-// - Le jour où le revenu le justifie, bascule sur l'API officielle
-//   Google Places (`lib/googlePlaces.ts` à créer sur le même modèle
-//   de retour que `ScrapedListing[]` ci-dessous, pour ne pas toucher au
-//   reste de l'app).
+// scanGoogleMaps continue de faire défiler la zone tant que le callback
+// `onListing` répond { keepGoing: true }, et détecte lui-même la "zone
+// épuisée" (Maps arrête de proposer de nouvelles fiches malgré le scroll).
+//
+// Optimisation : si `isKnownUrl` est fourni, une fiche déjà connue n'est
+// jamais rouverte (pas de navigation, pas d'attente) — seul un objet
+// minimal est transmis à `onListing`, pour laisser l'appelant compter la
+// fiche comme "déjà vue" sans repayer le coût d'une vraie visite de page.
+//
+// IMPORTANT : la page qui affiche la liste de résultats (le "feed") ne
+// navigue JAMAIS vers une fiche détaillée. Chaque fiche est ouverte dans
+// un onglet séparé (context.newPage()) puis refermée aussitôt — sinon la
+// page principale se retrouve coincée sur la dernière fiche visitée, le
+// feed disparaît, et le scraper croit à tort avoir épuisé la zone après
+// le premier lot de résultats (bug historique : arrêt systématique à 10).
+//
+// NOTE : une tentative précédente ajoutait un second BrowserContext dédié
+// aux fiches détail (recyclé périodiquement) pour limiter l'accumulation
+// mémoire de Chromium sur les scans longs. Sur cette machine, ça a
+// provoqué un blocage total et silencieux dès la toute première fiche
+// (aucune erreur, aucun timeout — juste plus rien). On revient donc à un
+// SEUL contexte partagé pour tout (feed + fiches détail), qui est la
+// version qui a fait ses preuves (100/100 sur "électricien lyon"). Si le
+// ralentissement progressif sur les scans très longs revient, on le
+// traitera séparément — sans jamais réintroduire un second contexte sans
+// l'avoir testé isolément.
+//
+// ATTENTION :
+// - Contraire aux CGU de Google. Usage à tes risques (CAPTCHA, blocage IP).
+// - Sélecteurs CSS de Maps fragiles — à ajuster si plus rien ne remonte.
 
 export type ScrapedListing = {
+  googleMapsUrl: string;
   name: string;
   category: string | null;
   address: string | null;
@@ -26,166 +42,296 @@ export type ScrapedListing = {
   postalCode: string | null;
   phone: string | null;
   website: string | null;
-  googleMapsUrl: string;
   rating: number | null;
   reviewsCount: number | null;
+  /** true si la fiche n'a volontairement pas été rouverte (déjà connue). */
+  skipped?: boolean;
 };
+
+export type ScanOutcome = "target_reached" | "zone_exhausted" | "error";
+
+function log(msg: string) {
+  console.log(`[scan ${new Date().toISOString().slice(11, 19)}] ${msg}`);
+}
 
 function extractPostalCodeAndCity(
   address: string | null
 ): { postalCode: string | null; city: string | null } {
   if (!address) return { postalCode: null, city: null };
-  // Format FR courant : "12 rue Exemple, 34000 Montpellier"
   const match = address.match(/(\d{5})\s+([A-Za-zÀ-ÿ\- ]+)/);
   if (!match) return { postalCode: null, city: null };
   return { postalCode: match[1], city: match[2].trim() };
 }
 
-export async function scrapeGoogleMaps(
-  query: string,
+async function extractListingFromPage(
+  page: Page,
+  url: string
+): Promise<ScrapedListing | null> {
+  const name = await page
+    .locator("h1")
+    .first()
+    .innerText({ timeout: 5000 })
+    .catch(() => "");
+  if (!name) return null;
+
+  // Timeout court (3s) sur chaque sélecteur optionnel : par défaut Playwright
+  // attend 30s avant d'abandonner un élément introuvable, et une fiche peut
+  // en avoir plusieurs qui manquent (pas de catégorie, pas d'avis...) — ça
+  // gonflait le temps par fiche jusqu'à plusieurs dizaines de secondes sans
+  // aucun bénéfice, puisque le résultat est de toute façon "non trouvé".
+  const address = await page
+    .locator('button[data-item-id^="address"]')
+    .first()
+    .getAttribute("aria-label", { timeout: 3000 })
+    .then((v) => v?.replace(/^Adresse\s*:\s*/i, "").trim() ?? null)
+    .catch(() => null);
+
+  const phone = await page
+    .locator('button[data-item-id^="phone:tel:"]')
+    .first()
+    .getAttribute("aria-label", { timeout: 3000 })
+    // Google Maps utilise plusieurs libellés selon les fiches
+    // ("Téléphone :", "Numéro de téléphone :", ...) : plutôt que de les
+    // lister tous, on retire simplement tout ce qui précède le premier
+    // chiffre, ce qui reste robuste si Google en introduit un nouveau.
+    .then((v) => v?.replace(/^[^\d+]+/, "").trim() ?? null)
+    .catch(() => null);
+
+  const website = await page
+    .locator('a[data-item-id="authority"]')
+    .first()
+    .getAttribute("href", { timeout: 3000 })
+    .catch(() => null);
+
+  const category = await page
+    .locator('button[jsaction*="category"]')
+    .first()
+    .innerText({ timeout: 3000 })
+    .catch(() => null);
+
+  const ratingText = await page
+    .locator('div.F7nice span[aria-hidden="true"]')
+    .first()
+    .innerText({ timeout: 3000 })
+    .catch(() => null);
+  const rating = ratingText ? parseFloat(ratingText.replace(",", ".")) : null;
+
+  const reviewsRaw = await page
+    .locator('div.F7nice span[aria-label*="avis"]')
+    .first()
+    .getAttribute("aria-label", { timeout: 3000 })
+    .catch(() => null);
+  const reviewsMatch = reviewsRaw?.match(/(\d[\d\s]*)/);
+  const reviewsCount = reviewsMatch
+    ? parseInt(reviewsMatch[1].replace(/\s/g, ""), 10)
+    : null;
+
+  const { postalCode, city } = extractPostalCodeAndCity(address);
+
+  return {
+    googleMapsUrl: url,
+    name: name.trim(),
+    category: category?.trim() || null,
+    address,
+    city,
+    postalCode,
+    phone,
+    website,
+    rating: Number.isFinite(rating) ? rating : null,
+    reviewsCount,
+  };
+}
+
+/**
+ * Ouvre une fiche dans un onglet dédié, l'extrait, puis referme l'onglet.
+ * Ne touche jamais à la page du feed.
+ */
+async function extractListing(
+  context: BrowserContext,
+  url: string
+): Promise<ScrapedListing | null> {
+  const t0 = Date.now();
+  log(`ouverture fiche ${url}`);
+  const detailPage = await context.newPage();
+  log(`onglet ouvert (${Date.now() - t0}ms)`);
+  try {
+    const tGotoStart = Date.now();
+    await detailPage.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    const gotoMs = Date.now() - tGotoStart;
+    await detailPage.waitForTimeout(500);
+    const result = await extractListingFromPage(detailPage, url);
+    log(
+      `fiche "${result?.name || "?"}" — goto ${gotoMs}ms, total ${Date.now() - t0}ms`
+    );
+    return result;
+  } catch (err) {
+    log(
+      `ÉCHEC fiche ${url} après ${Date.now() - t0}ms — ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return null;
+  } finally {
+    await detailPage.close().catch(() => {});
+  }
+}
+
+/**
+ * Fait défiler le feed avec un vrai geste de molette positionné sur la
+ * dernière fiche visible (Google Maps ignore souvent un scroll déclenché
+ * en JS pur ou un geste "dans le vide").
+ */
+async function scrollFeed(page: Page, feed: import("playwright").Locator) {
+  const cards = feed.locator('a[href*="/maps/place/"]');
+  const cardCount = await cards.count().catch(() => 0);
+
+  if (cardCount > 0) {
+    try {
+      await cards.nth(cardCount - 1).scrollIntoViewIfNeeded({ timeout: 3000 });
+      const box = await cards.nth(cardCount - 1).boundingBox();
+      if (box) {
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      }
+    } catch {
+      // pas grave, on scrolle quand même depuis la position actuelle de la souris
+    }
+  }
+
+  // Double geste de molette : un seul est parfois ignoré par Maps.
+  await page.mouse.wheel(0, 900);
+  await page.waitForTimeout(250);
+  await page.mouse.wheel(0, 900);
+
+  // Filet de sécurité : scroll JS direct sur le conteneur, en plus du
+  // geste de molette (ne fait pas de mal si le geste a déjà fonctionné).
+  await feed.evaluate((el) => el.scrollBy(0, 1200)).catch(() => {});
+}
+
+export async function scanGoogleMaps(
+  activite: string,
   zone: string,
-  maxResults = 20
-): Promise<ScrapedListing[]> {
+  onListing: (listing: ScrapedListing) => Promise<{ keepGoing: boolean }>,
+  options?: { isKnownUrl?: (url: string) => Promise<boolean> }
+): Promise<ScanOutcome> {
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-    ],
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
   });
-  const page = await browser.newPage({
+  const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     viewport: { width: 1366, height: 900 },
     locale: "fr-FR",
   });
+  const page = await context.newPage();
 
-  const results: ScrapedListing[] = [];
+  const visited = new Set<string>();
 
   try {
-    const searchTerm = `${query} ${zone}`;
+    const searchTerm = `${activite} ${zone}`;
+    const tSearchStart = Date.now();
     await page.goto(
       `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
       { waitUntil: "domcontentloaded", timeout: 30000 }
     );
+    log(`recherche "${searchTerm}" chargée en ${Date.now() - tSearchStart}ms`);
 
-    // Bandeau de consentement cookies (EU) — sélecteur texte, plus stable
-    // qu'une classe CSS.
     try {
       const consentButton = page.getByRole("button", {
         name: /tout accepter|j'accepte|accepter/i,
       });
       await consentButton.click({ timeout: 4000 });
+      log("bandeau de consentement accepté");
     } catch {
-      // pas de bandeau, on continue
+      // pas de bandeau
     }
 
     const feed = page.locator('div[role="feed"]');
     await feed.waitFor({ timeout: 15000 });
 
-    // Scroll progressif du panneau de résultats jusqu'à obtenir assez de
-    // liens ou jusqu'à ce que la liste arrête de grandir.
-    const hrefs = new Set<string>();
     let stagnantRounds = 0;
-    let lastCount = 0;
+    let lastHrefCount = 0;
+    let consecutiveFailures = 0;
+    let round = 0;
 
-    while (hrefs.size < maxResults && stagnantRounds < 4) {
-      const links = await page
-        .locator('a[href*="/maps/place/"]')
-        .evaluateAll((els) => els.map((e) => (e as HTMLAnchorElement).href));
-      links.forEach((h) => hrefs.add(h));
-
-      if (hrefs.size === lastCount) stagnantRounds++;
-      else stagnantRounds = 0;
-      lastCount = hrefs.size;
-
-      await feed.evaluate((el) => el.scrollBy(0, 1200));
-      await page.waitForTimeout(1200);
-    }
-
-    const targets = Array.from(hrefs).slice(0, maxResults);
-
-    for (const url of targets) {
+    while (true) {
+      round++;
+      const tRoundStart = Date.now();
+      let hrefs: string[];
       try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-        await page.waitForTimeout(800);
-
-        const name = await page
-          .locator("h1")
-          .first()
-          .innerText()
-          .catch(() => "");
-        if (!name) continue;
-
-        const address = await page
-          .locator('button[data-item-id^="address"]')
-          .first()
-          .getAttribute("aria-label")
-          .then((v) => v?.replace(/^Adresse\s*:\s*/i, "").trim() ?? null)
-          .catch(() => null);
-
-        const phone = await page
-          .locator('button[data-item-id^="phone:tel:"]')
-          .first()
-          .getAttribute("aria-label")
-          .then((v) => v?.replace(/^Téléphone\s*:\s*/i, "").trim() ?? null)
-          .catch(() => null);
-
-        const website = await page
-          .locator('a[data-item-id="authority"]')
-          .first()
-          .getAttribute("href")
-          .catch(() => null);
-
-        const category = await page
-          .locator('button[jsaction*="category"]')
-          .first()
-          .innerText()
-          .catch(() => null);
-
-        const ratingText = await page
-          .locator('div.F7nice span[aria-hidden="true"]')
-          .first()
-          .innerText()
-          .catch(() => null);
-        const rating = ratingText
-          ? parseFloat(ratingText.replace(",", "."))
-          : null;
-
-        const reviewsRaw = await page
-          .locator('div.F7nice span[aria-label*="avis"]')
-          .first()
-          .getAttribute("aria-label")
-          .catch(() => null);
-        const reviewsMatch = reviewsRaw?.match(/(\d[\d\s]*)/);
-        const reviewsCount = reviewsMatch
-          ? parseInt(reviewsMatch[1].replace(/\s/g, ""), 10)
-          : null;
-
-        const { postalCode, city } = extractPostalCodeAndCity(address);
-
-        results.push({
-          name: name.trim(),
-          category: category?.trim() || null,
-          address,
-          city,
-          postalCode,
-          phone,
-          website,
-          googleMapsUrl: url,
-          rating: Number.isFinite(rating) ? rating : null,
-          reviewsCount,
-        });
+        // On lit toujours les liens depuis `feed`, jamais depuis `page`
+        // en entier : la page principale ne quitte plus jamais cette vue,
+        // mais ça reste la lecture la plus fiable si Maps ajoute des
+        // liens "/maps/place/" ailleurs sur la page (pub, panneau latéral).
+        hrefs = await feed
+          .locator('a[href*="/maps/place/"]')
+          .evaluateAll((els) => els.map((e) => (e as HTMLAnchorElement).href));
       } catch {
-        // une fiche a échoué (mise en page inhabituelle, blocage
-        // ponctuel...) : on la saute plutôt que de tout interrompre.
+        // Coupure temporaire (page qui se réaffiche, ralentissement) :
+        // on laisse une seconde chance avant d'abandonner pour de bon.
+        consecutiveFailures++;
+        log(`tour ${round} : lecture des liens échouée (${consecutiveFailures}/4)`);
+        if (consecutiveFailures >= 4) {
+          return "error";
+        }
+        await page.waitForTimeout(3000);
         continue;
       }
+      consecutiveFailures = 0;
+
+      const fresh = hrefs.filter((h) => !visited.has(h));
+      log(`tour ${round} : ${hrefs.length} liens visibles, ${fresh.length} nouveaux`);
+
+      for (const url of fresh) {
+        visited.add(url);
+
+        const tKnownStart = Date.now();
+        const known = options?.isKnownUrl ? await options.isKnownUrl(url) : false;
+        const knownMs = Date.now() - tKnownStart;
+        if (knownMs > 1000) {
+          log(`vérification "déjà connue" lente : ${knownMs}ms`);
+        }
+
+        let listing: ScrapedListing | null;
+        if (known) {
+          // Déjà connue : on ne rouvre pas la fiche, juste un objet minimal.
+          listing = { googleMapsUrl: url, name: "", category: null, address: null, city: null, postalCode: null, phone: null, website: null, rating: null, reviewsCount: null, skipped: true };
+        } else {
+          // Ouverte dans un onglet séparé : la page du feed n'est jamais
+          // touchée, elle reste scrollable pour la suite du scan.
+          listing = await extractListing(context, url);
+        }
+
+        if (listing) {
+          const { keepGoing } = await onListing(listing);
+          if (!keepGoing) return "target_reached";
+        }
+      }
+
+      if (hrefs.length === lastHrefCount) stagnantRounds++;
+      else stagnantRounds = 0;
+      lastHrefCount = hrefs.length;
+
+      if (stagnantRounds >= 6) {
+        log(`zone épuisée après ${round} tours`);
+        return "zone_exhausted";
+      }
+
+      const tScrollStart = Date.now();
+      try {
+        await scrollFeed(page, feed);
+      } catch {
+        consecutiveFailures++;
+        if (consecutiveFailures >= 4) {
+          return "error";
+        }
+      }
+      await page.waitForTimeout(900);
+      log(
+        `tour ${round} terminé en ${Date.now() - tRoundStart}ms (scroll: ${Date.now() - tScrollStart}ms)`
+      );
     }
   } finally {
     await browser.close();
   }
-
-  return results;
 }

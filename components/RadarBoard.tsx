@@ -1,15 +1,15 @@
 import type { dictionary } from "@/lib/i18n";
 
 const targets = [
-  { name: "Plomberie Dubosc", zone: "Montpellier · 34", score: 92, x: "22%", y: "28%" },
-  { name: "Atelier Verrier", zone: "Nîmes · 30", score: 78, x: "62%", y: "18%" },
-  { name: "Rénov & Fils", zone: "Béziers · 34", score: 65, x: "40%", y: "58%" },
-  { name: "Toiture Occitane", zone: "Sète · 34", score: 54, x: "74%", y: "62%" },
+  { name: "Plomberie Dubosc", zone: "Montpellier · 34", rating: 4.8, x: "22%", y: "28%" },
+  { name: "Atelier Verrier", zone: "Nîmes · 30", rating: 4.2, x: "62%", y: "18%" },
+  { name: "Rénov & Fils", zone: "Béziers · 34", rating: 3.4, x: "40%", y: "58%" },
+  { name: "Toiture Occitane", zone: "Sète · 34", rating: 2.9, x: "74%", y: "62%" },
 ];
 
-function scoreColor(score: number) {
-  if (score >= 80) return "text-blaze border-blaze/50 bg-blaze/10";
-  if (score >= 60) return "text-signal border-signal/50 bg-signal/10";
+function scoreColor(rating: number) {
+  if (rating >= 4.5) return "text-blaze border-blaze/50 bg-blaze/10";
+  if (rating >= 3.5) return "text-signal border-signal/50 bg-signal/10";
   return "text-text-paper/70 border-text-paper/25 bg-text-paper/5";
 }
 
@@ -56,10 +56,10 @@ export default function RadarBoard({
             <span className="block h-2 w-2 animate-blip rounded-full bg-blaze" />
             <div
               className={`absolute left-1/2 top-4 -translate-x-1/2 whitespace-nowrap border px-2 py-1 font-mono text-[10px] ${scoreColor(
-                t.score
+                t.rating
               )}`}
             >
-              {t.score}
+              {t.rating.toFixed(1)}
             </div>
           </div>
         ))}
@@ -74,9 +74,9 @@ export default function RadarBoard({
               <p className="font-mono text-[11px] text-text-paper/45">{t.zone}</p>
             </div>
             <span
-              className={`border px-2 py-1 font-mono text-xs ${scoreColor(t.score)}`}
+              className={`border px-2 py-1 font-mono text-xs ${scoreColor(t.rating)}`}
             >
-              {t.score}
+              {t.rating.toFixed(1)}
             </span>
           </li>
         ))}
