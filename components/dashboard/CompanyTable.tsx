@@ -45,6 +45,10 @@ export default function CompanyTable({
   );
   const [pending, setPending] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  // Menu de statut tapable pour mobile/tactile : les raccourcis clavier
+  // 1-8 ne marchent pas sans clavier physique, donc on ouvre ce menu au
+  // tap sur le badge de statut, réutilisant applyStatus comme le clavier.
+  const [statusMenuId, setStatusMenuId] = useState<string | null>(null);
 
   const applyStatus = useCallback(
     async (
@@ -109,6 +113,7 @@ export default function CompanyTable({
       if (e.key === "Escape") {
         setSelectedId(null);
         setFeedback(null);
+        setStatusMenuId(null);
         return;
       }
 
@@ -139,6 +144,15 @@ export default function CompanyTable({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selectedId, companies, pending, applyStatus]);
+
+  useEffect(() => {
+    if (!statusMenuId) return;
+    function onClickAway() {
+      setStatusMenuId(null);
+    }
+    window.addEventListener("click", onClickAway);
+    return () => window.removeEventListener("click", onClickAway);
+  }, [statusMenuId]);
 
   const handleNotesSaved = useCallback(
     (companyId: string, notes: string | null) => {
@@ -212,10 +226,49 @@ export default function CompanyTable({
                       "—"
                     )}
                   </td>
-                  <td className="px-3 py-2">
-                    <span className="inline-block border border-ink/20 px-2 py-1 font-mono text-[11px] uppercase tracking-wide text-text-ink/70">
+                  <td className="relative px-3 py-2">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedId(c.id);
+                        setStatusMenuId(statusMenuId === c.id ? null : c.id);
+                      }}
+                      className="inline-block border border-ink/20 px-2 py-1 font-mono text-[11px] uppercase tracking-wide text-text-ink/70 hover:bg-ink/5"
+                    >
                       {STATUS_LABELS[c.status] ?? c.status}
-                    </span>
+                    </button>
+
+                    {statusMenuId === c.id && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="absolute left-3 top-full z-20 mt-1 grid w-48 grid-cols-1 gap-0.5 border border-line bg-paper p-1 shadow-lg"
+                      >
+                        {SHORTCUTS.map((s) => (
+                          <button
+                            key={s.code}
+                            type="button"
+                            onClick={() => {
+                              applyStatus(c.id, s.status, s.label);
+                              setStatusMenuId(null);
+                            }}
+                            className="px-2 py-1.5 text-left font-mono text-[11px] uppercase tracking-wide hover:bg-blaze/10"
+                          >
+                            {s.label}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            applyStatus(c.id, "a_contacter", "Statut annulé", false);
+                            setStatusMenuId(null);
+                          }}
+                          className="mt-0.5 border-t border-line px-2 py-1.5 text-left font-mono text-[11px] uppercase tracking-wide text-text-ink/60 hover:bg-ink/5"
+                        >
+                          Annuler
+                        </button>
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2 font-mono text-xs">
                     {(() => {
