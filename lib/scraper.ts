@@ -223,6 +223,23 @@ export async function scanGoogleMaps(
     viewport: { width: 1366, height: 900 },
     locale: "fr-FR",
   });
+
+  // Bloque images/médias/polices au niveau du context : il est partagé
+  // entre le feed et toutes les fiches détail (context.newPage()), donc
+  // une seule règle couvre tout, sans toucher à l'architecture page/context
+  // (cf. note plus haut sur la tentative de second context qui avait
+  // provoqué un blocage silencieux). On ne scrape que du texte (h1,
+  // boutons, attributs aria-label) : les images ne servent à rien ici et
+  // sont la principale source d'accumulation mémoire sur les scans longs
+  // (100-200 fiches dans le même browser, jamais relancé).
+  await context.route("**/*", (route) => {
+    const type = route.request().resourceType();
+    if (type === "image" || type === "media" || type === "font") {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
   const page = await context.newPage();
 
   const visited = new Set<string>();
