@@ -207,12 +207,29 @@ async function scrollFeed(page: Page, feed: import("playwright").Locator) {
   await feed.evaluate((el) => el.scrollBy(0, 1200)).catch(() => {});
 }
 
-export async function scanGoogleMaps(
+// Nombre de fiches (non "déjà connues") ouvertes avant de relancer tout le
+// navigateur. Même en bloquant images/médias/polices, Chromium accumule
+// progressivement de la mémoire sur un scan long (JS bundles, DOM, caches
+// internes) — la seule façon fiable de la libérer pour de vrai est de fermer
+// le browser et d'en relancer un neuf. Le Set `visited` est conservé d'une
+// session à l'autre, donc les fiches déjà vues sont filtrées avant même la
+// vérification "déjà connue" en base — pas de double travail, juste un peu
+// de temps perdu à rescroller depuis le début de la zone à chaque relance.
+const RECYCLE_AFTER_LISTINGS = 25;
+
+/**
+ * Ouvre un navigateur, lance la recherche et scrolle le feed jusqu'à
+ * atteindre l'objectif, épuiser la zone, tomber en erreur, ou dépasser
+ * RECYCLE_AFTER_LISTINGS nouvelles fiches (auquel cas le navigateur est
+ * fermé et scanGoogleMaps relance une session neuve).
+ */
+async function runOneSession(
   activite: string,
   zone: string,
+  visited: Set<string>,
   onListing: (listing: ScrapedListing) => Promise<{ keepGoing: boolean }>,
   options?: { isKnownUrl?: (url: string) => Promise<boolean> }
-): Promise<ScanOutcome> {
+): Promise<"target_reached" | "zone_exhausted" | "error" | "recycle"> {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -230,8 +247,7 @@ export async function scanGoogleMaps(
   // (cf. note plus haut sur la tentative de second context qui avait
   // provoqué un blocage silencieux). On ne scrape que du texte (h1,
   // boutons, attributs aria-label) : les images ne servent à rien ici et
-  // sont la principale source d'accumulation mémoire sur les scans longs
-  // (100-200 fiches dans le même browser, jamais relancé).
+  // sont la principale source d'accumulation mémoire sur les scans longs.
   await context.route("**/*", (route) => {
     const type = route.request().resourceType();
     if (type === "image" || type === "media" || type === "font") {
@@ -241,8 +257,7 @@ export async function scanGoogleMaps(
   });
 
   const page = await context.newPage();
-
-  const visited = new Set<string>();
+  let listingsThisSession = 0;
 
   try {
     const searchTerm = `${activite} ${zone}`;
@@ -322,6 +337,16 @@ export async function scanGoogleMaps(
         if (listing) {
           const { keepGoing } = await onListing(listing);
           if (!keepGoing) return "target_reached";
+
+          if (!known) {
+            listingsThisSession++;
+            if (listingsThisSession >= RECYCLE_AFTER_LISTINGS) {
+              log(
+                `recyclage du navigateur après ${listingsThisSession} fiches (mémoire) — relance de la recherche`
+              );
+              return "recycle";
+            }
+          }
         }
       }
 
@@ -350,5 +375,24 @@ export async function scanGoogleMaps(
     }
   } finally {
     await browser.close();
+  }
+}
+
+export async function scanGoogleMaps(
+  activite: string,
+  zone: string,
+  onListing: (listing: ScrapedListing) => Promise<{ keepGoing: boolean }>,
+  options?: { isKnownUrl?: (url: string) => Promise<boolean> }
+): Promise<ScanOutcome> {
+  // `visited` vit en dehors des sessions : après un recyclage, le nouveau
+  // navigateur repart de zéro sur Google Maps mais ignore instantanément
+  // tout ce qui a déjà été vu, sans même repasser par la vérification
+  // "déjà connue" en base.
+  const visited = new Set<string>();
+
+  while (true) {
+    const outcome = await runOneSession(activite, zone, visited, onListing, options);
+    if (outcome === "recycle") continue;
+    return outcome;
   }
 }
