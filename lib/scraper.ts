@@ -14,9 +14,8 @@ import {
 // - isKnownUrl est protégé contre les erreurs temporaires ;
 // - onListing est protégé contre les erreurs ;
 // - les crashs Chromium sont détectés explicitement ;
-// - le navigateur est recyclé périodiquement pour limiter
-//   l'accumulation mémoire sur Railway ;
-// - en cas de crash du feed, Chromium est redémarré automatiquement ;
+// - Chromium est recyclé périodiquement ;
+// - en cas de crash du feed, Chromium est redémarré immédiatement ;
 // - visited est conservé pendant les redémarrages.
 //
 // IMPORTANT : la page principale (feed) ne navigue JAMAIS vers une fiche.
@@ -44,6 +43,10 @@ export type ScanOutcome =
   | "target_reached"
   | "zone_exhausted"
   | "error";
+
+// ------------------------------------------------------------
+// Utilitaires
+// ------------------------------------------------------------
 
 function log(msg: string) {
   console.log(
@@ -98,6 +101,10 @@ function logMemory(label: string) {
   );
 }
 
+// ------------------------------------------------------------
+// Adresse
+// ------------------------------------------------------------
+
 function extractPostalCodeAndCity(
   address: string | null
 ): {
@@ -112,7 +119,7 @@ function extractPostalCodeAndCity(
   }
 
   const match = address.match(
-    /(\d{5})\s+([A-Za-zÀ-ÿ\- ]+)/
+    /(\d{5})\s+([A-Za-zÀ-ÿ0-9'’.\- ]+)/
   );
 
   if (!match) {
@@ -128,9 +135,10 @@ function extractPostalCodeAndCity(
   };
 }
 
-/**
- * Extrait les données d'une fiche Google Maps.
- */
+// ------------------------------------------------------------
+// Extraction d'une fiche
+// ------------------------------------------------------------
+
 async function extractListingFromPage(
   page: Page,
   url: string
@@ -258,12 +266,10 @@ async function extractListingFromPage(
   };
 }
 
-/**
- * Bloque les ressources lourdes uniquement sur les fiches.
- *
- * On NE bloque PAS les scripts, stylesheets ou XHR :
- * Google Maps peut en avoir besoin pour afficher les données.
- */
+// ------------------------------------------------------------
+// Optimisation des fiches
+// ------------------------------------------------------------
+
 async function optimizeDetailPage(
   page: Page
 ): Promise<void> {
@@ -285,19 +291,16 @@ async function optimizeDetailPage(
 
         await route.continue();
       } catch {
-        // La page peut déjà être morte.
+        // Page potentiellement déjà morte.
       }
     }
   );
 }
 
-/**
- * Ouvre une fiche dans un onglet dédié,
- * l'extrait, puis referme l'onglet.
- *
- * Une erreur sur cette fiche ne tue JAMAIS
- * le scan complet.
- */
+// ------------------------------------------------------------
+// Extraction d'une fiche individuelle
+// ------------------------------------------------------------
+
 async function extractListing(
   context: BrowserContext,
   url: string
@@ -309,7 +312,9 @@ async function extractListing(
   try {
     detailPage = await context.newPage();
 
-    await optimizeDetailPage(detailPage);
+    await optimizeDetailPage(
+      detailPage
+    );
 
     const tGotoStart = Date.now();
 
@@ -321,9 +326,7 @@ async function extractListing(
     const gotoMs =
       Date.now() - tGotoStart;
 
-    // Pas de page.waitForTimeout :
-    // un renderer mort peut provoquer exactement
-    // "page.waitForTimeout: Page crashed".
+    // Ne jamais utiliser page.waitForTimeout().
     await sleep(500);
 
     const result =
@@ -366,10 +369,10 @@ async function extractListing(
   }
 }
 
-/**
- * Fait défiler le feed avec un vrai geste
- * de molette positionné sur la dernière fiche visible.
- */
+// ------------------------------------------------------------
+// Scroll du feed
+// ------------------------------------------------------------
+
 async function scrollFeed(
   page: Page,
   feed: Locator
@@ -379,8 +382,7 @@ async function scrollFeed(
   );
 
   const cardCount = await cards
-    .count()
-    .catch(() => 0);
+    .count();
 
   if (cardCount > 0) {
     try {
@@ -401,7 +403,8 @@ async function scrollFeed(
         );
       }
     } catch {
-      // On continue avec le scroll global.
+      // Le scroll global ci-dessous
+      // reste la solution de secours.
     }
   }
 
@@ -411,16 +414,15 @@ async function scrollFeed(
 
   await page.mouse.wheel(0, 900);
 
-  await feed
-    .evaluate((el) => {
-      el.scrollBy(0, 1200);
-    })
-    .catch(() => {});
+  await feed.evaluate((el) => {
+    el.scrollBy(0, 1200);
+  });
 }
 
-/**
- * Lit les URLs du feed avec plusieurs tentatives.
- */
+// ------------------------------------------------------------
+// Lecture du feed
+// ------------------------------------------------------------
+
 async function readFeedUrls(
   feed: Locator,
   attempts = 4
@@ -453,7 +455,7 @@ async function readFeedUrls(
       lastError = err;
 
       if (attempt < attempts) {
-        await sleep(1500);
+        await sleep(1000);
       }
     }
   }
@@ -461,12 +463,10 @@ async function readFeedUrls(
   throw lastError;
 }
 
-/**
- * Vérifie une URL connue avec retries.
- *
- * Une erreur DB/réseau n'est jamais considérée
- * comme "URL inconnue".
- */
+// ------------------------------------------------------------
+// Vérification DB
+// ------------------------------------------------------------
+
 async function checkKnownUrl(
   isKnownUrl:
     | ((url: string) => Promise<boolean>)
@@ -495,7 +495,9 @@ async function checkKnownUrl(
       );
 
       if (attempt < 3) {
-        await sleep(1000 * attempt);
+        await sleep(
+          1000 * attempt
+        );
       }
     }
   }
@@ -503,31 +505,72 @@ async function checkKnownUrl(
   throw lastError;
 }
 
+// ------------------------------------------------------------
+// Session Chromium
+// ------------------------------------------------------------
+
+type BrowserSessionState = {
+  crashed: boolean;
+};
+
 type BrowserSession = {
   browser: Browser;
   context: BrowserContext;
   page: Page;
   feed: Locator;
-  crashed: boolean;
+
+  // IMPORTANT :
+  // Objet mutable partagé avec les listeners Playwright.
+  //
+  // On ne met surtout PAS :
+  // crashed: boolean
+  //
+  // car un boolean retourné depuis createBrowserSession()
+  // serait copié par valeur et ne serait jamais mis à jour.
+  state: BrowserSessionState;
 };
 
-/**
- * Lance une nouvelle session Chromium et ouvre
- * la recherche Google Maps.
- */
+// ------------------------------------------------------------
+// Vérifie si une session est morte
+// ------------------------------------------------------------
+
+function isSessionDead(
+  session: BrowserSession | null
+): boolean {
+  if (!session) {
+    return true;
+  }
+
+  return (
+    session.state.crashed ||
+    session.page.isClosed()
+  );
+}
+
+// ------------------------------------------------------------
+// Création d'une session Chromium
+// ------------------------------------------------------------
+
 async function createBrowserSession(
   searchUrl: string
 ): Promise<BrowserSession> {
-  const browser =
-    await chromium.launch({
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
+  let page: Page | null = null;
+
+  const state: BrowserSessionState = {
+    crashed: false,
+  };
+
+  try {
+    browser = await chromium.launch({
       headless: true,
+
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
 
-        // Réduisent certaines activités secondaires
-        // de Chromium sur un serveur headless.
         "--disable-background-networking",
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
@@ -537,99 +580,144 @@ async function createBrowserSession(
       ],
     });
 
-  let crashed = false;
+    browser.on(
+      "disconnected",
+      () => {
+        state.crashed = true;
 
-  browser.on("disconnected", () => {
-    crashed = true;
-
-    log(
-      "⚠ Chromium déconnecté"
+        log(
+          "⚠ Chromium déconnecté"
+        );
+      }
     );
-  });
 
-  const context =
-    await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-        "AppleWebKit/537.36 (KHTML, like Gecko) " +
-        "Chrome/124.0 Safari/537.36",
+    context =
+      await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/124.0 Safari/537.36",
 
-      viewport: {
-        width: 1366,
-        height: 900,
-      },
+        viewport: {
+          width: 1366,
+          height: 900,
+        },
 
-      locale: "fr-FR",
-    });
-
-  const page =
-    await context.newPage();
-
-  page.on("crash", () => {
-    crashed = true;
-
-    log(
-      "💥 CRASH DU RENDERER DE LA PAGE GOOGLE MAPS"
-    );
-  });
-
-  await page.goto(searchUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 30000,
-  });
-
-  log("recherche Google Maps chargée");
-
-  // ------------------------------------------------------------
-  // Consentement
-  // ------------------------------------------------------------
-
-  try {
-    const consentButton =
-      page.getByRole("button", {
-        name:
-          /tout accepter|j'accepte|accepter/i,
+        locale: "fr-FR",
       });
 
-    await consentButton.click({
-      timeout: 4000,
+    page =
+      await context.newPage();
+
+    page.on("crash", () => {
+      state.crashed = true;
+
+      log(
+        "💥 CRASH DU RENDERER DE LA PAGE GOOGLE MAPS"
+      );
     });
 
+    await page.goto(searchUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+
+    if (state.crashed) {
+      throw new Error(
+        "Le renderer Google Maps a crashé pendant le chargement initial"
+      );
+    }
+
     log(
-      "bandeau de consentement accepté"
+      "recherche Google Maps chargée"
     );
-  } catch {
-    // Aucun bandeau : normal.
+
+    // ----------------------------------------------------------
+    // Consentement
+    // ----------------------------------------------------------
+
+    try {
+      const consentButton =
+        page.getByRole("button", {
+          name:
+            /tout accepter|j'accepte|accepter/i,
+        });
+
+      await consentButton.click({
+        timeout: 4000,
+      });
+
+      log(
+        "bandeau de consentement accepté"
+      );
+    } catch {
+      // Aucun bandeau : normal.
+    }
+
+    if (state.crashed) {
+      throw new Error(
+        "Le renderer Google Maps a crashé après le chargement"
+      );
+    }
+
+    // ----------------------------------------------------------
+    // Feed
+    // ----------------------------------------------------------
+
+    const feed = page.locator(
+      'div[role="feed"]'
+    );
+
+    await feed.waitFor({
+      timeout: 15000,
+    });
+
+    if (state.crashed) {
+      throw new Error(
+        "Le renderer Google Maps a crashé pendant la détection du feed"
+      );
+    }
+
+    log(
+      "feed Google Maps détecté"
+    );
+
+    return {
+      browser,
+      context,
+      page,
+      feed,
+      state,
+    };
+  } catch (err) {
+    // Si la création initiale échoue,
+    // on nettoie TOUT avant de relancer l'erreur.
+    if (page) {
+      await page
+        .close()
+        .catch(() => {});
+    }
+
+    if (context) {
+      await context
+        .close()
+        .catch(() => {});
+    }
+
+    if (browser) {
+      await browser
+        .close()
+        .catch(() => {});
+    }
+
+    throw err;
   }
-
-  // ------------------------------------------------------------
-  // Feed
-  // ------------------------------------------------------------
-
-  const feed = page.locator(
-    'div[role="feed"]'
-  );
-
-  await feed.waitFor({
-    timeout: 15000,
-  });
-
-  log(
-    "feed Google Maps détecté"
-  );
-
-  return {
-    browser,
-    context,
-    page,
-    feed,
-    crashed,
-  };
 }
 
-/**
- * Ferme proprement une session Chromium.
- */
+// ------------------------------------------------------------
+// Fermeture Chromium
+// ------------------------------------------------------------
+
 async function closeBrowserSession(
   session: BrowserSession | null
 ): Promise<void> {
@@ -649,6 +737,10 @@ async function closeBrowserSession(
     .close()
     .catch(() => {});
 }
+
+// ------------------------------------------------------------
+// Scan principal
+// ------------------------------------------------------------
 
 export async function scanGoogleMaps(
   activite: string,
@@ -678,7 +770,12 @@ export async function scanGoogleMaps(
 
   let consecutiveFailures = 0;
 
-  let recoveryCount = 0;
+  // Nombre de récupérations consécutives.
+  //
+  // On le remet à zéro après un tour réussi.
+  // Ainsi un crash occasionnel ne condamne pas
+  // tout le scan.
+  let recoveryStreak = 0;
 
   let processedSinceRecycle = 0;
 
@@ -686,14 +783,15 @@ export async function scanGoogleMaps(
   // Limites de sécurité
   // ------------------------------------------------------------
 
-  // On recycle Chromium régulièrement.
-  // Cela évite de garder un renderer Google Maps vivant
-  // pendant plusieurs centaines de fiches.
-  const RECYCLE_EVERY = 40;
+  // Beaucoup plus prudent que 40.
+  //
+  // L'objectif est d'éviter de laisser le même Chromium
+  // gérer trop longtemps Google Maps + les onglets de fiches.
+  const RECYCLE_EVERY = 20;
 
-  // Évite une boucle infinie si Railway/Chromium
-  // est réellement incapable de tenir le scan.
-  const MAX_RECOVERIES = 3;
+  // Si Chromium crash plusieurs fois d'affilée,
+  // on arrête plutôt que de boucler indéfiniment.
+  const MAX_CONSECUTIVE_RECOVERIES = 5;
 
   const searchTerm =
     `${activite} ${zone}`;
@@ -701,6 +799,70 @@ export async function scanGoogleMaps(
   const searchUrl =
     `https://www.google.com/maps/search/` +
     `${encodeURIComponent(searchTerm)}?hl=fr`;
+
+  // ------------------------------------------------------------
+  // Fonction locale de récupération
+  // ------------------------------------------------------------
+
+  const recoverSession =
+    async (
+      reason: string
+    ): Promise<boolean> => {
+      recoveryStreak++;
+
+      log(
+        `💥 récupération Chromium — ` +
+          `${reason} — ` +
+          `tentative ${recoveryStreak}/${MAX_CONSECUTIVE_RECOVERIES}`
+      );
+
+      if (
+        recoveryStreak >
+        MAX_CONSECUTIVE_RECOVERIES
+      ) {
+        log(
+          "scan arrêté : trop de crashs Chromium consécutifs"
+        );
+
+        return false;
+      }
+
+      await closeBrowserSession(
+        session
+      );
+
+      session = null;
+
+      await sleep(2000);
+
+      try {
+        session =
+          await createBrowserSession(
+            searchUrl
+          );
+
+        stagnantRounds = 0;
+        lastHrefCount = 0;
+        consecutiveFailures = 0;
+        processedSinceRecycle = 0;
+
+        log(
+          `✓ Chromium redémarré — ` +
+            `${visited.size} fiches déjà visitées conservées`
+        );
+
+        return true;
+      } catch (err) {
+        logError(
+          "échec du redémarrage Chromium",
+          err
+        );
+
+        session = null;
+
+        return false;
+      }
+    };
 
   try {
     log(
@@ -710,13 +872,22 @@ export async function scanGoogleMaps(
     logMemory("début");
 
     // ----------------------------------------------------------
-    // Première session Chromium
+    // Première session
     // ----------------------------------------------------------
 
-    session =
-      await createBrowserSession(
-        searchUrl
+    try {
+      session =
+        await createBrowserSession(
+          searchUrl
+        );
+    } catch (err) {
+      logError(
+        "impossible de démarrer Chromium",
+        err
       );
+
+      return "error";
+    }
 
     // ----------------------------------------------------------
     // Boucle principale
@@ -729,54 +900,20 @@ export async function scanGoogleMaps(
         Date.now();
 
       // --------------------------------------------------------
-      // Vérification du renderer
+      // Vérification immédiate de l'état Chromium
       // --------------------------------------------------------
 
       if (
-        session.crashed ||
-        session.page.isClosed()
+        isSessionDead(session)
       ) {
-        recoveryCount++;
-
-        log(
-          `💥 feed Chromium mort — ` +
-            `récupération ${recoveryCount}/${MAX_RECOVERIES}`
-        );
-
-        if (
-          recoveryCount > MAX_RECOVERIES
-        ) {
-          log(
-            "scan arrêté : trop de crashs Chromium"
+        const recovered =
+          await recoverSession(
+            "feed Chromium mort avant lecture"
           );
 
+        if (!recovered) {
           return "error";
         }
-
-        await closeBrowserSession(
-          session
-        );
-
-        session = null;
-
-        await sleep(2000);
-
-        session =
-          await createBrowserSession(
-            searchUrl
-          );
-
-        // Le feed repart du début.
-        // visited est conservé, donc les anciennes
-        // fiches ne seront pas retraitées.
-        stagnantRounds = 0;
-        lastHrefCount = 0;
-        consecutiveFailures = 0;
-
-        log(
-          `✓ Chromium redémarré — ` +
-            `${visited.size} fiches déjà visitées conservées`
-        );
 
         continue;
       }
@@ -788,61 +925,52 @@ export async function scanGoogleMaps(
       let hrefs: string[];
 
       try {
-        hrefs = await readFeedUrls(
-          session.feed,
-          4
-        );
+        hrefs =
+          await readFeedUrls(
+            session.feed,
+            4
+          );
 
         consecutiveFailures = 0;
       } catch (err) {
-        consecutiveFailures++;
+        const message =
+          errorMessage(err);
 
         logError(
-          `tour ${round} : lecture du feed échouée ` +
-            `(${consecutiveFailures}/4)`,
+          `tour ${round} : lecture du feed échouée`,
           err
         );
 
-        // Si c'est un crash renderer, on ne perd
-        // pas de temps avec 4 retries inutiles.
+        // ------------------------------------------------------
+        // CRASH = récupération immédiate
+        // ------------------------------------------------------
+
         if (
-          session.crashed ||
-          errorMessage(err).includes(
+          isSessionDead(session) ||
+          message.includes(
             "Page crashed"
+          ) ||
+          message.includes(
+            "Target crashed"
           )
         ) {
-          recoveryCount++;
+          const recovered =
+            await recoverSession(
+              "crash pendant lecture du feed"
+            );
 
-          log(
-            `💥 crash détecté pendant lecture feed — ` +
-              `récupération ${recoveryCount}/${MAX_RECOVERIES}`
-          );
-
-          if (
-            recoveryCount > MAX_RECOVERIES
-          ) {
+          if (!recovered) {
             return "error";
           }
 
-          await closeBrowserSession(
-            session
-          );
-
-          session = null;
-
-          await sleep(2000);
-
-          session =
-            await createBrowserSession(
-              searchUrl
-            );
-
-          stagnantRounds = 0;
-          lastHrefCount = 0;
-          consecutiveFailures = 0;
-
           continue;
         }
+
+        // ------------------------------------------------------
+        // Erreur temporaire normale
+        // ------------------------------------------------------
+
+        consecutiveFailures++;
 
         if (
           consecutiveFailures >= 4
@@ -860,13 +988,33 @@ export async function scanGoogleMaps(
       }
 
       // --------------------------------------------------------
-      // Nouvelles URLs
+      // Vérification après lecture
       // --------------------------------------------------------
 
-      const fresh = hrefs.filter(
-        (url) =>
-          !visited.has(url)
-      );
+      if (
+        isSessionDead(session)
+      ) {
+        const recovered =
+          await recoverSession(
+            "crash détecté après lecture du feed"
+          );
+
+        if (!recovered) {
+          return "error";
+        }
+
+        continue;
+      }
+
+      // --------------------------------------------------------
+      // URLs nouvelles
+      // --------------------------------------------------------
+
+      const fresh =
+        hrefs.filter(
+          (url) =>
+            !visited.has(url)
+        );
 
       log(
         `tour ${round} : ` +
@@ -875,14 +1023,43 @@ export async function scanGoogleMaps(
       );
 
       // --------------------------------------------------------
-      // Traitement des fiches
+      // Traitement des nouvelles fiches
       // --------------------------------------------------------
 
+      let sessionRecoveredDuringRound =
+        false;
+
       for (const url of fresh) {
+        // On mémorise immédiatement l'URL.
+        //
+        // Si Chromium crash ensuite, elle ne sera pas
+        // retraitée indéfiniment.
         visited.add(url);
 
         // ------------------------------------------------------
-        // Vérification URL connue
+        // Vérification session AVANT chaque fiche
+        // ------------------------------------------------------
+
+        if (
+          isSessionDead(session)
+        ) {
+          const recovered =
+            await recoverSession(
+              "crash avant traitement d'une fiche"
+            );
+
+          if (!recovered) {
+            return "error";
+          }
+
+          sessionRecoveredDuringRound =
+            true;
+
+          break;
+        }
+
+        // ------------------------------------------------------
+        // URL connue
         // ------------------------------------------------------
 
         let known = false;
@@ -903,8 +1080,7 @@ export async function scanGoogleMaps(
 
           if (knownMs > 1000) {
             log(
-              `vérification déjà connue lente : ` +
-                `${knownMs}ms`
+              `vérification déjà connue lente : ${knownMs}ms`
             );
           }
         } catch (err) {
@@ -949,10 +1125,35 @@ export async function scanGoogleMaps(
         processedSinceRecycle++;
 
         // ------------------------------------------------------
-        // Fiche illisible
+        // IMPORTANT :
+        // Une fiche peut avoir crashé sans que Chromium
+        // principal soit mort.
+        //
+        // extractListing() absorbe volontairement son erreur.
+        // On continue donc normalement.
         // ------------------------------------------------------
 
         if (!listing) {
+          // Mais on vérifie quand même si Chromium principal
+          // est mort pendant ce temps.
+          if (
+            isSessionDead(session)
+          ) {
+            const recovered =
+              await recoverSession(
+                "crash du feed pendant extraction d'une fiche"
+              );
+
+            if (!recovered) {
+              return "error";
+            }
+
+            sessionRecoveredDuringRound =
+              true;
+
+            break;
+          }
+
           continue;
         }
 
@@ -999,7 +1200,29 @@ export async function scanGoogleMaps(
         }
 
         // ------------------------------------------------------
-        // Recyclage préventif Chromium
+        // CRASH DU FEED APRÈS LA FICHE
+        // ------------------------------------------------------
+
+        if (
+          isSessionDead(session)
+        ) {
+          const recovered =
+            await recoverSession(
+              "crash du feed après traitement d'une fiche"
+            );
+
+          if (!recovered) {
+            return "error";
+          }
+
+          sessionRecoveredDuringRound =
+            true;
+
+          break;
+        }
+
+        // ------------------------------------------------------
+        // Recyclage préventif
         // ------------------------------------------------------
 
         if (
@@ -1033,6 +1256,7 @@ export async function scanGoogleMaps(
 
             stagnantRounds = 0;
             lastHrefCount = 0;
+            consecutiveFailures = 0;
 
             log(
               `✓ Chromium recyclé — ` +
@@ -1048,65 +1272,47 @@ export async function scanGoogleMaps(
               err
             );
 
-            return "error";
-          }
-        }
+            session = null;
 
-        // ------------------------------------------------------
-        // Si le feed a crashé pendant l'extraction
-        // ------------------------------------------------------
-
-        if (
-          session.crashed ||
-          session.page.isClosed()
-        ) {
-          recoveryCount++;
-
-          log(
-            `💥 crash du feed détecté après traitement ` +
-              `de ${visited.size} fiches — ` +
-              `récupération ${recoveryCount}/${MAX_RECOVERIES}`
-          );
-
-          if (
-            recoveryCount > MAX_RECOVERIES
-          ) {
             return "error";
           }
 
-          await closeBrowserSession(
-            session
-          );
-
-          session = null;
-
-          await sleep(2000);
-
-          session =
-            await createBrowserSession(
-              searchUrl
-            );
-
-          stagnantRounds = 0;
-          lastHrefCount = 0;
-          consecutiveFailures = 0;
+          sessionRecoveredDuringRound =
+            true;
 
           break;
         }
       }
 
       // --------------------------------------------------------
-      // Si la session a été recyclée/crashée pendant le tour
+      // Une récupération/reconnexion vient d'avoir lieu.
+      //
+      // On recommence la boucle avec le nouveau feed.
+      // visited reste intact.
       // --------------------------------------------------------
 
-      if (!session) {
+      if (
+        sessionRecoveredDuringRound
+      ) {
         continue;
       }
 
+      // --------------------------------------------------------
+      // Vérification session avant scroll
+      // --------------------------------------------------------
+
       if (
-        session.crashed ||
-        session.page.isClosed()
+        isSessionDead(session)
       ) {
+        const recovered =
+          await recoverSession(
+            "feed mort avant scroll"
+          );
+
+        if (!recovered) {
+          return "error";
+        }
+
         continue;
       }
 
@@ -1151,54 +1357,44 @@ export async function scanGoogleMaps(
 
         consecutiveFailures = 0;
       } catch (err) {
-        consecutiveFailures++;
+        const message =
+          errorMessage(err);
 
         logError(
-          `tour ${round} : scroll échoué ` +
-            `(${consecutiveFailures}/4)`,
+          `tour ${round} : scroll échoué`,
           err
         );
 
-        // Crash du renderer = récupération immédiate.
+        // ------------------------------------------------------
+        // CRASH = récupération immédiate
+        // ------------------------------------------------------
+
         if (
-          session.crashed ||
-          session.page.isClosed() ||
-          errorMessage(err).includes(
+          isSessionDead(session) ||
+          message.includes(
             "Page crashed"
+          ) ||
+          message.includes(
+            "Target crashed"
           )
         ) {
-          recoveryCount++;
+          const recovered =
+            await recoverSession(
+              "crash pendant scroll"
+            );
 
-          log(
-            `💥 crash pendant scroll — ` +
-              `récupération ${recoveryCount}/${MAX_RECOVERIES}`
-          );
-
-          if (
-            recoveryCount > MAX_RECOVERIES
-          ) {
+          if (!recovered) {
             return "error";
           }
 
-          await closeBrowserSession(
-            session
-          );
-
-          session = null;
-
-          await sleep(2000);
-
-          session =
-            await createBrowserSession(
-              searchUrl
-            );
-
-          stagnantRounds = 0;
-          lastHrefCount = 0;
-          consecutiveFailures = 0;
-
           continue;
         }
+
+        // ------------------------------------------------------
+        // Erreur scroll temporaire
+        // ------------------------------------------------------
+
+        consecutiveFailures++;
 
         if (
           consecutiveFailures >= 4
@@ -1209,52 +1405,41 @@ export async function scanGoogleMaps(
 
           return "error";
         }
-      }
 
-      // IMPORTANT :
-      // Ne plus utiliser page.waitForTimeout ici.
-      //
-      // Si Chromium vient de mourir pendant le scroll,
-      // waitForTimeout() lui-même déclenche :
-      // "page.waitForTimeout: Page crashed"
-      await sleep(900);
-
-      if (
-        session.crashed ||
-        session.page.isClosed()
-      ) {
-        recoveryCount++;
-
-        log(
-          `💥 crash détecté après scroll — ` +
-            `récupération ${recoveryCount}/${MAX_RECOVERIES}`
-        );
-
-        if (
-          recoveryCount > MAX_RECOVERIES
-        ) {
-          return "error";
-        }
-
-        await closeBrowserSession(
-          session
-        );
-
-        session = null;
-
-        await sleep(2000);
-
-        session =
-          await createBrowserSession(
-            searchUrl
-          );
-
-        stagnantRounds = 0;
-        lastHrefCount = 0;
-        consecutiveFailures = 0;
+        await sleep(3000);
 
         continue;
       }
+
+      // --------------------------------------------------------
+      // Attente entre deux scrolls
+      // --------------------------------------------------------
+
+      // Pas de page.waitForTimeout().
+      await sleep(900);
+
+      // --------------------------------------------------------
+      // Vérification crash après scroll
+      // --------------------------------------------------------
+
+      if (
+        isSessionDead(session)
+      ) {
+        const recovered =
+          await recoverSession(
+            "crash détecté après scroll"
+          );
+
+        if (!recovered) {
+          return "error";
+        }
+
+        continue;
+      }
+
+      // --------------------------------------------------------
+      // Tour terminé correctement
+      // --------------------------------------------------------
 
       log(
         `tour ${round} terminé en ` +
@@ -1263,6 +1448,10 @@ export async function scanGoogleMaps(
             Date.now() - tScrollStart
           }ms)`
       );
+
+      // Un tour complet sans crash =
+      // on considère que Chromium est à nouveau stable.
+      recoveryStreak = 0;
 
       // --------------------------------------------------------
       // Monitoring mémoire
@@ -1277,10 +1466,6 @@ export async function scanGoogleMaps(
       }
     }
   } catch (err) {
-    // ----------------------------------------------------------
-    // ERREUR GLOBALE
-    // ----------------------------------------------------------
-
     logError(
       "ERREUR FATALE DU SCAN",
       err
@@ -1288,16 +1473,10 @@ export async function scanGoogleMaps(
 
     return "error";
   } finally {
-    // ----------------------------------------------------------
-    // Nettoyage
-    // ----------------------------------------------------------
-
     await closeBrowserSession(
       session
     );
 
-    logMemory(
-      "fin"
-    );
+    logMemory("fin");
   }
 }
