@@ -258,6 +258,25 @@ const MEMORY_RECYCLE_THRESHOLD = 0.5;
 const HARD_RECYCLE_CEILING = 20;
 
 /**
+ * Lit la mémoire du conteneur et indique si le seuil de recyclage est
+ * dépassé. Factorisé pour être appelé à deux endroits : après chaque fiche
+ * ouverte (comme avant), et maintenant aussi après chaque tour de scroll
+ * (le scroll seul — nouvelles tuiles de carte, nouvelles cartes de
+ * résultats — peut faire grimper la mémoire avant même l'ouverture d'une
+ * fiche, cf. crash observé pendant un scroll avec 104 liens accumulés).
+ */
+function checkMemoryThreshold(): { overThreshold: boolean; memInfo: string } {
+  const mem = readContainerMemoryUsage();
+  const ratio = mem && mem.limitBytes !== Infinity ? mem.usedBytes / mem.limitBytes : null;
+  const overThreshold = ratio !== null && ratio >= MEMORY_RECYCLE_THRESHOLD;
+  const memInfo =
+    ratio !== null
+      ? `${Math.round(mem!.usedBytes / 1024 / 1024)}Mo/${Math.round(mem!.limitBytes / 1024 / 1024)}Mo (${Math.round(ratio * 100)}%)`
+      : "mémoire non lisible";
+  return { overThreshold, memInfo };
+}
+
+/**
  * Ouvre un navigateur, lance la recherche et scrolle le feed jusqu'à
  * atteindre l'objectif, épuiser la zone, tomber en erreur, ou dépasser
  * RECYCLE_AFTER_LISTINGS nouvelles fiches (auquel cas le navigateur est
@@ -277,7 +296,12 @@ async function runOneSession(
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    viewport: { width: 1366, height: 900 },
+    // Viewport réduit (était 1366×900) : en headless personne ne regarde
+    // l'écran, et une fenêtre plus petite fait que Maps charge/rend moins
+    // de tuiles de carte en WebGL — le coût mémoire de la carte est
+    // proportionnel à la surface visible. Sans impact sur la lecture des
+    // données : on ne lit que du texte/attributs, jamais de capture d'écran.
+    viewport: { width: 800, height: 600 },
     locale: "fr-FR",
   });
 
@@ -406,18 +430,14 @@ async function runOneSession(
           if (!known) {
             listingsThisSession++;
 
-            const mem = readContainerMemoryUsage();
-            const ratio = mem && mem.limitBytes !== Infinity ? mem.usedBytes / mem.limitBytes : null;
-            const overMemoryThreshold = ratio !== null && ratio >= MEMORY_RECYCLE_THRESHOLD;
+            const { overThreshold, memInfo } = checkMemoryThreshold();
             const overHardCeiling = listingsThisSession >= HARD_RECYCLE_CEILING;
 
-            if (overMemoryThreshold || overHardCeiling) {
-              const memInfo =
-                ratio !== null
-                  ? `${Math.round((mem!.usedBytes / 1024 / 1024))}Mo/${Math.round(mem!.limitBytes / 1024 / 1024)}Mo (${Math.round(ratio * 100)}%)`
-                  : "mémoire non lisible, plafond fixe atteint";
+            if (overThreshold || overHardCeiling) {
               log(
-                `recyclage du navigateur après ${listingsThisSession} fiches — ${memInfo} — relance de la recherche`
+                `recyclage du navigateur après ${listingsThisSession} fiches — ${
+                  overThreshold ? memInfo : "mémoire non lisible, plafond fixe atteint"
+                } — relance de la recherche`
               );
               return "recycle";
             }
@@ -449,6 +469,23 @@ async function runOneSession(
           return "error";
         }
       }
+
+      // Vérifie la mémoire aussi ici, pas seulement après une fiche ouverte :
+      // le scroll seul (chargement de nouvelles tuiles de carte, nouvelles
+      // cartes de résultats dans le feed) peut faire grimper la mémoire
+      // jusqu'au seuil, voire au-delà, avant même que la prochaine fiche
+      // ne soit ouverte et ne déclenche le check habituel. C'est exactement
+      // ce qui s'est produit sur le crash avec 104 liens accumulés en 7
+      // tours de scroll, jamais vérifiés entre-temps.
+      const { overThreshold: overThresholdAfterScroll, memInfo: memInfoAfterScroll } =
+        checkMemoryThreshold();
+      if (overThresholdAfterScroll) {
+        log(
+          `recyclage du navigateur après le tour ${round} (scroll) — ${memInfoAfterScroll} — relance de la recherche`
+        );
+        return "recycle";
+      }
+
       await page.waitForTimeout(900);
       log(
         `tour ${round} terminé en ${Date.now() - tRoundStart}ms (scroll: ${Date.now() - tScrollStart}ms)`
