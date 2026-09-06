@@ -1,4 +1,5 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
+import { readFileSync } from "fs";
 
 // Scraper Google Maps — moteur de découverte incrémentale.
 //
@@ -207,15 +208,50 @@ async function scrollFeed(page: Page, feed: import("playwright").Locator) {
   await feed.evaluate((el) => el.scrollBy(0, 1200)).catch(() => {});
 }
 
-// Nombre de fiches (non "déjà connues") ouvertes avant de relancer tout le
-// navigateur. Même en bloquant images/médias/polices, Chromium accumule
-// progressivement de la mémoire sur un scan long (JS bundles, DOM, caches
-// internes) — la seule façon fiable de la libérer pour de vrai est de fermer
-// le browser et d'en relancer un neuf. Le Set `visited` est conservé d'une
-// session à l'autre, donc les fiches déjà vues sont filtrées avant même la
-// vérification "déjà connue" en base — pas de double travail, juste un peu
-// de temps perdu à rescroller depuis le début de la zone à chaque relance.
-const RECYCLE_AFTER_LISTINGS = 25;
+// Le scraper (process Node) et Chromium sont deux processus séparés : la
+// mémoire qui fait planter le conteneur est celle de Chromium (et ses
+// sous-processus renderer), pas celle de Node — `process.memoryUsage()` ne
+// la verrait donc jamais. La seule mesure fiable est celle du conteneur
+// dans son ensemble, lue directement dans le cgroup (Node + Chromium +
+// tous ses enfants).
+function readContainerMemoryUsage(): { usedBytes: number; limitBytes: number } | null {
+  try {
+    // cgroup v2 (Railway et la plupart des conteneurs récents)
+    const used = parseInt(readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim(), 10);
+    const limitRaw = readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+    const limit = limitRaw === "max" ? Infinity : parseInt(limitRaw, 10);
+    if (Number.isFinite(used) && limit > 0) return { usedBytes: used, limitBytes: limit };
+  } catch {
+    // on tente le fallback cgroup v1 ci-dessous
+  }
+  try {
+    // cgroup v1 (anciens conteneurs)
+    const used = parseInt(
+      readFileSync("/sys/fs/cgroup/memory/memory.usage_in_bytes", "utf8").trim(),
+      10
+    );
+    const limit = parseInt(
+      readFileSync("/sys/fs/cgroup/memory/memory.limit_in_bytes", "utf8").trim(),
+      10
+    );
+    if (Number.isFinite(used) && Number.isFinite(limit) && limit > 0) {
+      return { usedBytes: used, limitBytes: limit };
+    }
+  } catch {
+    // ni v2 ni v1 lisible (environnement local, macOS, etc.)
+  }
+  return null;
+}
+
+// Seuil de recyclage : dès que le conteneur dépasse cette fraction de sa
+// limite mémoire, on ferme le navigateur et on en relance un neuf plutôt
+// que d'attendre le crash.
+const MEMORY_RECYCLE_THRESHOLD = 0.75;
+
+// Filet de sécurité si /sys/fs/cgroup n'est pas lisible (ex: en local) :
+// on garde un plafond fixe de fiches par session pour ne jamais tourner
+// indéfiniment sans aucun recyclage.
+const HARD_RECYCLE_CEILING = 40;
 
 /**
  * Ouvre un navigateur, lance la recherche et scrolle le feed jusqu'à
@@ -340,12 +376,28 @@ async function runOneSession(
 
           if (!known) {
             listingsThisSession++;
-            if (listingsThisSession >= RECYCLE_AFTER_LISTINGS) {
+
+            const mem = readContainerMemoryUsage();
+            const ratio = mem && mem.limitBytes !== Infinity ? mem.usedBytes / mem.limitBytes : null;
+            const overMemoryThreshold = ratio !== null && ratio >= MEMORY_RECYCLE_THRESHOLD;
+            const overHardCeiling = listingsThisSession >= HARD_RECYCLE_CEILING;
+
+            if (overMemoryThreshold || overHardCeiling) {
+              const memInfo =
+                ratio !== null
+                  ? `${Math.round((mem!.usedBytes / 1024 / 1024))}Mo/${Math.round(mem!.limitBytes / 1024 / 1024)}Mo (${Math.round(ratio * 100)}%)`
+                  : "mémoire non lisible, plafond fixe atteint";
               log(
-                `recyclage du navigateur après ${listingsThisSession} fiches (mémoire) — relance de la recherche`
+                `recyclage du navigateur après ${listingsThisSession} fiches — ${memInfo} — relance de la recherche`
               );
               return "recycle";
             }
+
+            // Petite pause aléatoire entre deux fiches : ça laisse le temps
+            // à Chromium de faire un peu de ménage entre deux ouvertures,
+            // et ça réduit le rythme de scraping (plus dur à détecter côté
+            // Google que 1 fiche toutes les 1-3s en continu).
+            await page.waitForTimeout(700 + Math.floor(Math.random() * 900));
           }
         }
       }
