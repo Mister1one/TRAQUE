@@ -245,13 +245,17 @@ function readContainerMemoryUsage(): { usedBytes: number; limitBytes: number } |
 
 // Seuil de recyclage : dès que le conteneur dépasse cette fraction de sa
 // limite mémoire, on ferme le navigateur et on en relance un neuf plutôt
-// que d'attendre le crash.
-const MEMORY_RECYCLE_THRESHOLD = 0.75;
+// que d'attendre le crash. Volontairement bas (50%, pas 75%) : le check ne
+// se fait qu'entre deux fiches, donc un pic pendant le chargement d'UNE
+// fiche peut dépasser le seuil avant même la prochaine vérification (vu en
+// pratique : 999Mo/1000Mo avec un seuil à 75%). Une grosse marge évite de
+// jouer à un cheveu du crash à chaque scan.
+const MEMORY_RECYCLE_THRESHOLD = 0.5;
 
 // Filet de sécurité si /sys/fs/cgroup n'est pas lisible (ex: en local) :
 // on garde un plafond fixe de fiches par session pour ne jamais tourner
 // indéfiniment sans aucun recyclage.
-const HARD_RECYCLE_CEILING = 40;
+const HARD_RECYCLE_CEILING = 20;
 
 /**
  * Ouvre un navigateur, lance la recherche et scrolle le feed jusqu'à
