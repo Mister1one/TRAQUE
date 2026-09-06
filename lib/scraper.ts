@@ -3,35 +3,23 @@ import { chromium, type BrowserContext, type Page } from "playwright";
 // Scraper Google Maps — moteur de découverte incrémentale.
 //
 // scanGoogleMaps continue de faire défiler la zone tant que le callback
-// `onListing` répond { keepGoing: true }, et détecte lui-même la "zone
-// épuisée" (Maps arrête de proposer de nouvelles fiches malgré le scroll).
+// `onListing` répond { keepGoing: true }.
 //
-// Optimisation : si `isKnownUrl` est fourni, une fiche déjà connue n'est
-// jamais rouverte (pas de navigation, pas d'attente) — seul un objet
-// minimal est transmis à `onListing`, pour laisser l'appelant compter la
-// fiche comme "déjà vue" sans repayer le coût d'une vraie visite de page.
+// Robustesse :
+// - une fiche individuelle qui échoue ne tue pas le scan ;
+// - les lectures du feed sont retentées avant abandon ;
+// - isKnownUrl est protégé contre les erreurs temporaires ;
+// - onListing est protégé contre les erreurs pour éviter qu'une exception
+//   applicative fasse disparaître tout le scan sans diagnostic ;
+// - les erreurs réelles sont loguées avec leur stack pour identifier
+//   rapidement un problème Railway / DB / réseau / Playwright.
 //
-// IMPORTANT : la page qui affiche la liste de résultats (le "feed") ne
-// navigue JAMAIS vers une fiche détaillée. Chaque fiche est ouverte dans
-// un onglet séparé (context.newPage()) puis refermée aussitôt — sinon la
-// page principale se retrouve coincée sur la dernière fiche visitée, le
-// feed disparaît, et le scraper croit à tort avoir épuisé la zone après
-// le premier lot de résultats (bug historique : arrêt systématique à 10).
-//
-// NOTE : une tentative précédente ajoutait un second BrowserContext dédié
-// aux fiches détail (recyclé périodiquement) pour limiter l'accumulation
-// mémoire de Chromium sur les scans longs. Sur cette machine, ça a
-// provoqué un blocage total et silencieux dès la toute première fiche
-// (aucune erreur, aucun timeout — juste plus rien). On revient donc à un
-// SEUL contexte partagé pour tout (feed + fiches détail), qui est la
-// version qui a fait ses preuves (100/100 sur "électricien lyon"). Si le
-// ralentissement progressif sur les scans très longs revient, on le
-// traitera séparément — sans jamais réintroduire un second contexte sans
-// l'avoir testé isolément.
+// IMPORTANT : la page principale (feed) ne navigue JAMAIS vers une fiche.
+// Chaque fiche est ouverte dans un onglet séparé puis refermée.
 //
 // ATTENTION :
 // - Contraire aux CGU de Google. Usage à tes risques (CAPTCHA, blocage IP).
-// - Sélecteurs CSS de Maps fragiles — à ajuster si plus rien ne remonte.
+// - Sélecteurs CSS de Maps fragiles — à ajuster si nécessaire.
 
 export type ScrapedListing = {
   googleMapsUrl: string;
@@ -54,13 +42,38 @@ function log(msg: string) {
   console.log(`[scan ${new Date().toISOString().slice(11, 19)}] ${msg}`);
 }
 
+function logError(context: string, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+
+  console.error(`[scan] ${context}: ${message}`);
+
+  if (stack) {
+    console.error(stack);
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function extractPostalCodeAndCity(
   address: string | null
 ): { postalCode: string | null; city: string | null } {
-  if (!address) return { postalCode: null, city: null };
+  if (!address) {
+    return { postalCode: null, city: null };
+  }
+
   const match = address.match(/(\d{5})\s+([A-Za-zÀ-ÿ\- ]+)/);
-  if (!match) return { postalCode: null, city: null };
-  return { postalCode: match[1], city: match[2].trim() };
+
+  if (!match) {
+    return { postalCode: null, city: null };
+  }
+
+  return {
+    postalCode: match[1],
+    city: match[2].trim(),
+  };
 }
 
 async function extractListingFromPage(
@@ -72,29 +85,29 @@ async function extractListingFromPage(
     .first()
     .innerText({ timeout: 5000 })
     .catch(() => "");
-  if (!name) return null;
 
-  // Timeout court (3s) sur chaque sélecteur optionnel : par défaut Playwright
-  // attend 30s avant d'abandonner un élément introuvable, et une fiche peut
-  // en avoir plusieurs qui manquent (pas de catégorie, pas d'avis...) — ça
-  // gonflait le temps par fiche jusqu'à plusieurs dizaines de secondes sans
-  // aucun bénéfice, puisque le résultat est de toute façon "non trouvé".
+  if (!name) {
+    return null;
+  }
+
   const address = await page
     .locator('button[data-item-id^="address"]')
     .first()
     .getAttribute("aria-label", { timeout: 3000 })
-    .then((v) => v?.replace(/^Adresse\s*:\s*/i, "").trim() ?? null)
+    .then(
+      (value) =>
+        value?.replace(/^Adresse\s*:\s*/i, "").trim() ?? null
+    )
     .catch(() => null);
 
   const phone = await page
     .locator('button[data-item-id^="phone:tel:"]')
     .first()
     .getAttribute("aria-label", { timeout: 3000 })
-    // Google Maps utilise plusieurs libellés selon les fiches
-    // ("Téléphone :", "Numéro de téléphone :", ...) : plutôt que de les
-    // lister tous, on retire simplement tout ce qui précède le premier
-    // chiffre, ce qui reste robuste si Google en introduit un nouveau.
-    .then((v) => v?.replace(/^[^\d+]+/, "").trim() ?? null)
+    .then(
+      (value) =>
+        value?.replace(/^[^\d+]+/, "").trim() ?? null
+    )
     .catch(() => null);
 
   const website = await page
@@ -114,19 +127,25 @@ async function extractListingFromPage(
     .first()
     .innerText({ timeout: 3000 })
     .catch(() => null);
-  const rating = ratingText ? parseFloat(ratingText.replace(",", ".")) : null;
+
+  const rating = ratingText
+    ? parseFloat(ratingText.replace(",", "."))
+    : null;
 
   const reviewsRaw = await page
     .locator('div.F7nice span[aria-label*="avis"]')
     .first()
     .getAttribute("aria-label", { timeout: 3000 })
     .catch(() => null);
+
   const reviewsMatch = reviewsRaw?.match(/(\d[\d\s]*)/);
+
   const reviewsCount = reviewsMatch
     ? parseInt(reviewsMatch[1].replace(/\s/g, ""), 10)
     : null;
 
-  const { postalCode, city } = extractPostalCodeAndCity(address);
+  const { postalCode, city } =
+    extractPostalCodeAndCity(address);
 
   return {
     googleMapsUrl: url,
@@ -144,194 +163,557 @@ async function extractListingFromPage(
 
 /**
  * Ouvre une fiche dans un onglet dédié, l'extrait, puis referme l'onglet.
- * Ne touche jamais à la page du feed.
+ *
+ * Une erreur sur cette fiche ne tue JAMAIS le scan complet.
  */
 async function extractListing(
   context: BrowserContext,
   url: string
 ): Promise<ScrapedListing | null> {
   const t0 = Date.now();
-  log(`ouverture fiche ${url}`);
-  const detailPage = await context.newPage();
-  log(`onglet ouvert (${Date.now() - t0}ms)`);
+  let detailPage: Page | null = null;
+
   try {
+    detailPage = await context.newPage();
+
     const tGotoStart = Date.now();
-    await detailPage.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+
+    await detailPage.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000,
+    });
+
     const gotoMs = Date.now() - tGotoStart;
+
     await detailPage.waitForTimeout(500);
-    const result = await extractListingFromPage(detailPage, url);
-    log(
-      `fiche "${result?.name || "?"}" — goto ${gotoMs}ms, total ${Date.now() - t0}ms`
+
+    const result = await extractListingFromPage(
+      detailPage,
+      url
     );
+
+    if (result) {
+      log(
+        `✓ fiche "${result.name}" — goto ${gotoMs}ms, total ${
+          Date.now() - t0
+        }ms`
+      );
+    } else {
+      log(
+        `⚠ fiche illisible — total ${Date.now() - t0}ms`
+      );
+    }
+
     return result;
   } catch (err) {
-    log(
-      `ÉCHEC fiche ${url} après ${Date.now() - t0}ms — ${
-        err instanceof Error ? err.message : String(err)
-      }`
+    logError(
+      `échec extraction fiche après ${Date.now() - t0}ms`,
+      err
     );
+
     return null;
   } finally {
-    await detailPage.close().catch(() => {});
+    if (detailPage) {
+      await detailPage.close().catch(() => {});
+    }
   }
 }
 
 /**
  * Fait défiler le feed avec un vrai geste de molette positionné sur la
- * dernière fiche visible (Google Maps ignore souvent un scroll déclenché
- * en JS pur ou un geste "dans le vide").
+ * dernière fiche visible.
  */
-async function scrollFeed(page: Page, feed: import("playwright").Locator) {
-  const cards = feed.locator('a[href*="/maps/place/"]');
-  const cardCount = await cards.count().catch(() => 0);
+async function scrollFeed(
+  page: Page,
+  feed: import("playwright").Locator
+) {
+  const cards = feed.locator(
+    'a[href*="/maps/place/"]'
+  );
+
+  const cardCount = await cards
+    .count()
+    .catch(() => 0);
 
   if (cardCount > 0) {
     try {
-      await cards.nth(cardCount - 1).scrollIntoViewIfNeeded({ timeout: 3000 });
-      const box = await cards.nth(cardCount - 1).boundingBox();
+      const lastCard = cards.nth(cardCount - 1);
+
+      await lastCard.scrollIntoViewIfNeeded({
+        timeout: 3000,
+      });
+
+      const box = await lastCard.boundingBox();
+
       if (box) {
-        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.move(
+          box.x + box.width / 2,
+          box.y + box.height / 2
+        );
       }
     } catch {
-      // pas grave, on scrolle quand même depuis la position actuelle de la souris
+      // On continue avec le scroll global.
     }
   }
 
-  // Double geste de molette : un seul est parfois ignoré par Maps.
-  await page.mouse.wheel(0, 900);
-  await page.waitForTimeout(250);
   await page.mouse.wheel(0, 900);
 
-  // Filet de sécurité : scroll JS direct sur le conteneur, en plus du
-  // geste de molette (ne fait pas de mal si le geste a déjà fonctionné).
-  await feed.evaluate((el) => el.scrollBy(0, 1200)).catch(() => {});
+  await page.waitForTimeout(250);
+
+  await page.mouse.wheel(0, 900);
+
+  await feed
+    .evaluate((el) => el.scrollBy(0, 1200))
+    .catch(() => {});
+}
+
+/**
+ * Lit les URLs du feed avec plusieurs tentatives.
+ *
+ * Maps peut temporairement reconstruire le DOM pendant un scroll.
+ * Une erreur ponctuelle ne doit donc pas tuer le scan.
+ */
+async function readFeedUrls(
+  feed: import("playwright").Locator,
+  attempts = 4
+): Promise<string[]> {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const hrefs = await feed
+        .locator('a[href*="/maps/place/"]')
+        .evaluateAll((els) =>
+          els
+            .map((element) =>
+              (element as HTMLAnchorElement).href
+            )
+            .filter(Boolean)
+        );
+
+      return hrefs;
+    } catch (err) {
+      lastError = err;
+
+      if (attempt < attempts) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1500)
+        );
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * Vérifie une URL connue avec quelques retries.
+ *
+ * On ne considère jamais une erreur DB/réseau comme "URL inconnue",
+ * afin d'éviter d'insérer accidentellement des doublons.
+ */
+async function checkKnownUrl(
+  isKnownUrl: ((url: string) => Promise<boolean>) | undefined,
+  url: string
+): Promise<boolean> {
+  if (!isKnownUrl) {
+    return false;
+  }
+
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await isKnownUrl(url);
+    } catch (err) {
+      lastError = err;
+
+      logError(
+        `vérification URL connue échouée (${attempt}/3)`,
+        err
+      );
+
+      if (attempt < 3) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1000 * attempt)
+        );
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 export async function scanGoogleMaps(
   activite: string,
   zone: string,
-  onListing: (listing: ScrapedListing) => Promise<{ keepGoing: boolean }>,
-  options?: { isKnownUrl?: (url: string) => Promise<boolean> }
+  onListing: (
+    listing: ScrapedListing
+  ) => Promise<{ keepGoing: boolean }>,
+  options?: {
+    isKnownUrl?: (url: string) => Promise<boolean>;
+  }
 ): Promise<ScanOutcome> {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    viewport: { width: 1366, height: 900 },
-    locale: "fr-FR",
-  });
-  const page = await context.newPage();
+  let browser: Awaited<
+    ReturnType<typeof chromium.launch>
+  > | null = null;
+
+  let context: BrowserContext | null = null;
+  let page: Page | null = null;
 
   const visited = new Set<string>();
 
   try {
+    // ------------------------------------------------------------
+    // 1. Chromium
+    // ------------------------------------------------------------
+
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+      ],
+    });
+
+    context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/124.0 Safari/537.36",
+      viewport: {
+        width: 1366,
+        height: 900,
+      },
+      locale: "fr-FR",
+    });
+
+    page = await context.newPage();
+
+    // ------------------------------------------------------------
+    // 2. Recherche Google Maps
+    // ------------------------------------------------------------
+
     const searchTerm = `${activite} ${zone}`;
+
+    const searchUrl =
+      `https://www.google.com/maps/search/` +
+      `${encodeURIComponent(searchTerm)}?hl=fr`;
+
     const tSearchStart = Date.now();
-    await page.goto(
-      `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
-      { waitUntil: "domcontentloaded", timeout: 30000 }
+
+    await page.goto(searchUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+
+    log(
+      `recherche "${searchTerm}" chargée en ${
+        Date.now() - tSearchStart
+      }ms`
     );
-    log(`recherche "${searchTerm}" chargée en ${Date.now() - tSearchStart}ms`);
+
+    // ------------------------------------------------------------
+    // 3. Consentement
+    // ------------------------------------------------------------
 
     try {
-      const consentButton = page.getByRole("button", {
-        name: /tout accepter|j'accepte|accepter/i,
+      const consentButton = page.getByRole(
+        "button",
+        {
+          name: /tout accepter|j'accepte|accepter/i,
+        }
+      );
+
+      await consentButton.click({
+        timeout: 4000,
       });
-      await consentButton.click({ timeout: 4000 });
+
       log("bandeau de consentement accepté");
     } catch {
-      // pas de bandeau
+      // Aucun bandeau : normal.
     }
 
-    const feed = page.locator('div[role="feed"]');
-    await feed.waitFor({ timeout: 15000 });
+    // ------------------------------------------------------------
+    // 4. Feed
+    // ------------------------------------------------------------
+
+    const feed = page.locator(
+      'div[role="feed"]'
+    );
+
+    await feed.waitFor({
+      timeout: 15000,
+    });
+
+    log("feed Google Maps détecté");
+
+    // ------------------------------------------------------------
+    // 5. État du scan
+    // ------------------------------------------------------------
 
     let stagnantRounds = 0;
     let lastHrefCount = 0;
     let consecutiveFailures = 0;
     let round = 0;
 
+    // ------------------------------------------------------------
+    // 6. Boucle principale
+    // ------------------------------------------------------------
+
     while (true) {
       round++;
+
       const tRoundStart = Date.now();
+
+      // ----------------------------------------------------------
+      // Lecture des fiches visibles
+      // ----------------------------------------------------------
+
       let hrefs: string[];
+
       try {
-        // On lit toujours les liens depuis `feed`, jamais depuis `page`
-        // en entier : la page principale ne quitte plus jamais cette vue,
-        // mais ça reste la lecture la plus fiable si Maps ajoute des
-        // liens "/maps/place/" ailleurs sur la page (pub, panneau latéral).
-        hrefs = await feed
-          .locator('a[href*="/maps/place/"]')
-          .evaluateAll((els) => els.map((e) => (e as HTMLAnchorElement).href));
-      } catch {
-        // Coupure temporaire (page qui se réaffiche, ralentissement) :
-        // on laisse une seconde chance avant d'abandonner pour de bon.
+        hrefs = await readFeedUrls(feed, 4);
+
+        consecutiveFailures = 0;
+      } catch (err) {
         consecutiveFailures++;
-        log(`tour ${round} : lecture des liens échouée (${consecutiveFailures}/4)`);
+
+        logError(
+          `tour ${round} : lecture du feed échouée ` +
+            `(${consecutiveFailures}/4)`,
+          err
+        );
+
         if (consecutiveFailures >= 4) {
+          log(
+            `scan arrêté : impossible de lire le feed après 4 tentatives`
+          );
+
           return "error";
         }
+
         await page.waitForTimeout(3000);
+
         continue;
       }
-      consecutiveFailures = 0;
 
-      const fresh = hrefs.filter((h) => !visited.has(h));
-      log(`tour ${round} : ${hrefs.length} liens visibles, ${fresh.length} nouveaux`);
+      // ----------------------------------------------------------
+      // Nouvelles URLs
+      // ----------------------------------------------------------
+
+      const fresh = hrefs.filter(
+        (url) => !visited.has(url)
+      );
+
+      log(
+        `tour ${round} : ${hrefs.length} liens visibles, ` +
+          `${fresh.length} nouveaux`
+      );
+
+      // ----------------------------------------------------------
+      // Traitement des fiches
+      // ----------------------------------------------------------
 
       for (const url of fresh) {
         visited.add(url);
 
-        const tKnownStart = Date.now();
-        const known = options?.isKnownUrl ? await options.isKnownUrl(url) : false;
-        const knownMs = Date.now() - tKnownStart;
-        if (knownMs > 1000) {
-          log(`vérification "déjà connue" lente : ${knownMs}ms`);
+        // --------------------------------------------------------
+        // Vérification "déjà connue"
+        // --------------------------------------------------------
+
+        let known = false;
+
+        try {
+          const tKnownStart = Date.now();
+
+          known = await checkKnownUrl(
+            options?.isKnownUrl,
+            url
+          );
+
+          const knownMs =
+            Date.now() - tKnownStart;
+
+          if (knownMs > 1000) {
+            log(
+              `vérification déjà connue lente : ${knownMs}ms`
+            );
+          }
+        } catch (err) {
+          // IMPORTANT :
+          // On arrête plutôt que de considérer la fiche comme nouvelle.
+          // Sinon une panne DB peut provoquer des doublons.
+          logError(
+            `impossible de vérifier si la fiche est déjà connue`,
+            err
+          );
+
+          return "error";
         }
+
+        // --------------------------------------------------------
+        // Extraction
+        // --------------------------------------------------------
 
         let listing: ScrapedListing | null;
+
         if (known) {
-          // Déjà connue : on ne rouvre pas la fiche, juste un objet minimal.
-          listing = { googleMapsUrl: url, name: "", category: null, address: null, city: null, postalCode: null, phone: null, website: null, rating: null, reviewsCount: null, skipped: true };
+          listing = {
+            googleMapsUrl: url,
+            name: "",
+            category: null,
+            address: null,
+            city: null,
+            postalCode: null,
+            phone: null,
+            website: null,
+            rating: null,
+            reviewsCount: null,
+            skipped: true,
+          };
         } else {
-          // Ouverte dans un onglet séparé : la page du feed n'est jamais
-          // touchée, elle reste scrollable pour la suite du scan.
-          listing = await extractListing(context, url);
+          listing = await extractListing(
+            context,
+            url
+          );
         }
 
-        if (listing) {
-          const { keepGoing } = await onListing(listing);
-          if (!keepGoing) return "target_reached";
+        // --------------------------------------------------------
+        // Callback applicatif
+        // --------------------------------------------------------
+
+        if (!listing) {
+          // Une fiche Google Maps illisible ne doit PAS tuer le scan.
+          continue;
         }
-      }
 
-      if (hrefs.length === lastHrefCount) stagnantRounds++;
-      else stagnantRounds = 0;
-      lastHrefCount = hrefs.length;
+        try {
+          const result = await onListing(
+            listing
+          );
 
-      if (stagnantRounds >= 6) {
-        log(`zone épuisée après ${round} tours`);
-        return "zone_exhausted";
-      }
+          if (!result || typeof result.keepGoing !== "boolean") {
+            log(
+              `onListing a retourné une réponse invalide`
+            );
 
-      const tScrollStart = Date.now();
-      try {
-        await scrollFeed(page, feed);
-      } catch {
-        consecutiveFailures++;
-        if (consecutiveFailures >= 4) {
+            return "error";
+          }
+
+          if (!result.keepGoing) {
+            log(
+              `objectif atteint après ${visited.size} fiches consultées`
+            );
+
+            return "target_reached";
+          }
+        } catch (err) {
+          // C'est extrêmement important :
+          // avant, une exception de onListing pouvait remonter
+          // directement jusqu'au niveau supérieur et transformer
+          // le scan en simple "problème technique".
+          logError(
+            `ERREUR DANS onListing pour la fiche "${listing.name || "?"}"`,
+            err
+          );
+
           return "error";
         }
       }
+
+      // ----------------------------------------------------------
+      // Détection de zone épuisée
+      // ----------------------------------------------------------
+
+      if (hrefs.length === lastHrefCount) {
+        stagnantRounds++;
+      } else {
+        stagnantRounds = 0;
+      }
+
+      lastHrefCount = hrefs.length;
+
+      if (stagnantRounds >= 6) {
+        log(
+          `zone épuisée après ${round} tours`
+        );
+
+        return "zone_exhausted";
+      }
+
+      // ----------------------------------------------------------
+      // Scroll
+      // ----------------------------------------------------------
+
+      const tScrollStart = Date.now();
+
+      try {
+        await scrollFeed(page, feed);
+
+        consecutiveFailures = 0;
+      } catch (err) {
+        consecutiveFailures++;
+
+        logError(
+          `tour ${round} : scroll échoué ` +
+            `(${consecutiveFailures}/4)`,
+          err
+        );
+
+        if (consecutiveFailures >= 4) {
+          log(
+            `scan arrêté : scroll impossible après 4 tentatives`
+          );
+
+          return "error";
+        }
+      }
+
       await page.waitForTimeout(900);
+
       log(
-        `tour ${round} terminé en ${Date.now() - tRoundStart}ms (scroll: ${Date.now() - tScrollStart}ms)`
+        `tour ${round} terminé en ${
+          Date.now() - tRoundStart
+        }ms ` +
+          `(scroll: ${
+            Date.now() - tScrollStart
+          }ms)`
       );
     }
+  } catch (err) {
+    // ------------------------------------------------------------
+    // ERREUR GLOBALE
+    // ------------------------------------------------------------
+    //
+    // Toute erreur qui aurait échappé aux protections précédentes
+    // est capturée ici avec sa vraie stack.
+    //
+    // L'interface peut continuer à afficher "problème technique",
+    // mais Railway aura maintenant la vraie cause dans les logs.
+
+    logError(
+      "ERREUR FATALE DU SCAN",
+      err
+    );
+
+    return "error";
   } finally {
-    await browser.close();
+    // ------------------------------------------------------------
+    // Nettoyage
+    // ------------------------------------------------------------
+
+    if (page) {
+      await page.close().catch(() => {});
+    }
+
+    if (context) {
+      await context.close().catch(() => {});
+    }
+
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
   }
 }
