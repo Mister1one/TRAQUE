@@ -1,4 +1,5 @@
 import { chromium, type BrowserContext, type Page } from "playwright";
+import { readFileSync } from "fs";
 
 // Scraper Google Maps — moteur de découverte incrémentale.
 //
@@ -207,12 +208,87 @@ async function scrollFeed(page: Page, feed: import("playwright").Locator) {
   await feed.evaluate((el) => el.scrollBy(0, 1200)).catch(() => {});
 }
 
-export async function scanGoogleMaps(
+// Le scraper (process Node) et Chromium sont deux processus séparés : la
+// mémoire qui fait planter le conteneur est celle de Chromium (et ses
+// sous-processus renderer), pas celle de Node — `process.memoryUsage()` ne
+// la verrait donc jamais. La seule mesure fiable est celle du conteneur
+// dans son ensemble, lue directement dans le cgroup (Node + Chromium +
+// tous ses enfants).
+function readContainerMemoryUsage(): { usedBytes: number; limitBytes: number } | null {
+  try {
+    // cgroup v2 (Railway et la plupart des conteneurs récents)
+    const used = parseInt(readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim(), 10);
+    const limitRaw = readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+    const limit = limitRaw === "max" ? Infinity : parseInt(limitRaw, 10);
+    if (Number.isFinite(used) && limit > 0) return { usedBytes: used, limitBytes: limit };
+  } catch {
+    // on tente le fallback cgroup v1 ci-dessous
+  }
+  try {
+    // cgroup v1 (anciens conteneurs)
+    const used = parseInt(
+      readFileSync("/sys/fs/cgroup/memory/memory.usage_in_bytes", "utf8").trim(),
+      10
+    );
+    const limit = parseInt(
+      readFileSync("/sys/fs/cgroup/memory/memory.limit_in_bytes", "utf8").trim(),
+      10
+    );
+    if (Number.isFinite(used) && Number.isFinite(limit) && limit > 0) {
+      return { usedBytes: used, limitBytes: limit };
+    }
+  } catch {
+    // ni v2 ni v1 lisible (environnement local, macOS, etc.)
+  }
+  return null;
+}
+
+// Seuil de recyclage : dès que le conteneur dépasse cette fraction de sa
+// limite mémoire, on ferme le navigateur et on en relance un neuf plutôt
+// que d'attendre le crash. Volontairement bas (50%, pas 75%) : le check ne
+// se fait qu'entre deux fiches, donc un pic pendant le chargement d'UNE
+// fiche peut dépasser le seuil avant même la prochaine vérification (vu en
+// pratique : 999Mo/1000Mo avec un seuil à 75%). Une grosse marge évite de
+// jouer à un cheveu du crash à chaque scan.
+const MEMORY_RECYCLE_THRESHOLD = 0.5;
+
+// Filet de sécurité si /sys/fs/cgroup n'est pas lisible (ex: en local) :
+// on garde un plafond fixe de fiches par session pour ne jamais tourner
+// indéfiniment sans aucun recyclage.
+const HARD_RECYCLE_CEILING = 20;
+
+/**
+ * Lit la mémoire du conteneur et indique si le seuil de recyclage est
+ * dépassé. Factorisé pour être appelé à deux endroits : après chaque fiche
+ * ouverte (comme avant), et maintenant aussi après chaque tour de scroll
+ * (le scroll seul — nouvelles tuiles de carte, nouvelles cartes de
+ * résultats — peut faire grimper la mémoire avant même l'ouverture d'une
+ * fiche, cf. crash observé pendant un scroll avec 104 liens accumulés).
+ */
+function checkMemoryThreshold(): { overThreshold: boolean; memInfo: string } {
+  const mem = readContainerMemoryUsage();
+  const ratio = mem && mem.limitBytes !== Infinity ? mem.usedBytes / mem.limitBytes : null;
+  const overThreshold = ratio !== null && ratio >= MEMORY_RECYCLE_THRESHOLD;
+  const memInfo =
+    ratio !== null
+      ? `${Math.round(mem!.usedBytes / 1024 / 1024)}Mo/${Math.round(mem!.limitBytes / 1024 / 1024)}Mo (${Math.round(ratio * 100)}%)`
+      : "mémoire non lisible";
+  return { overThreshold, memInfo };
+}
+
+/**
+ * Ouvre un navigateur, lance la recherche et scrolle le feed jusqu'à
+ * atteindre l'objectif, épuiser la zone, tomber en erreur, ou dépasser
+ * RECYCLE_AFTER_LISTINGS nouvelles fiches (auquel cas le navigateur est
+ * fermé et scanGoogleMaps relance une session neuve).
+ */
+async function runOneSession(
   activite: string,
   zone: string,
+  visited: Set<string>,
   onListing: (listing: ScrapedListing) => Promise<{ keepGoing: boolean }>,
   options?: { isKnownUrl?: (url: string) => Promise<boolean> }
-): Promise<ScanOutcome> {
+): Promise<"target_reached" | "zone_exhausted" | "error" | "recycle"> {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -220,34 +296,113 @@ export async function scanGoogleMaps(
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    viewport: { width: 1366, height: 900 },
+    // Viewport réduit (était 1366×900) : en headless personne ne regarde
+    // l'écran, et une fenêtre plus petite fait que Maps charge/rend moins
+    // de tuiles de carte en WebGL — le coût mémoire de la carte est
+    // proportionnel à la surface visible. Sans impact sur la lecture des
+    // données : on ne lit que du texte/attributs, jamais de capture d'écran.
+    viewport: { width: 800, height: 600 },
     locale: "fr-FR",
   });
-  const page = await context.newPage();
 
-  const visited = new Set<string>();
+  // Bloque images/médias/polices au niveau du context : il est partagé
+  // entre le feed et toutes les fiches détail (context.newPage()), donc
+  // une seule règle couvre tout, sans toucher à l'architecture page/context
+  // (cf. note plus haut sur la tentative de second context qui avait
+  // provoqué un blocage silencieux). On ne scrape que du texte (h1,
+  // boutons, attributs aria-label) : les images ne servent à rien ici et
+  // sont la principale source d'accumulation mémoire sur les scans longs.
+  await context.route("**/*", (route) => {
+    const type = route.request().resourceType();
+    if (type === "image" || type === "media" || type === "font") {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
+  const page = await context.newPage();
+  let listingsThisSession = 0;
 
   try {
     const searchTerm = `${activite} ${zone}`;
-    const tSearchStart = Date.now();
-    await page.goto(
-      `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
-      { waitUntil: "domcontentloaded", timeout: 30000 }
-    );
-    log(`recherche "${searchTerm}" chargée en ${Date.now() - tSearchStart}ms`);
 
-    try {
-      const consentButton = page.getByRole("button", {
-        name: /tout accepter|j'accepte|accepter/i,
-      });
-      await consentButton.click({ timeout: 4000 });
-      log("bandeau de consentement accepté");
-    } catch {
-      // pas de bandeau
-    }
-
+    // Ouvre la recherche, accepte le bandeau de consentement, et attend le
+    // feed — le tout dans une fonction ré-essayable : après un recyclage,
+    // cette séquence peut ponctuellement échouer (Google redirige vers
+    // consent.google.com et ne revient pas à temps, coupure réseau...)
+    // sans que ça veuille dire que la recherche elle-même pose problème.
+    // Un simple nouvel essai (nouvelle navigation, sur la même page) suffit
+    // dans l'immense majorité des cas.
     const feed = page.locator('div[role="feed"]');
-    await feed.waitFor({ timeout: 15000 });
+    const MAX_SEARCH_ATTEMPTS = 3;
+
+    for (let attempt = 1; attempt <= MAX_SEARCH_ATTEMPTS; attempt++) {
+      try {
+        const tSearchStart = Date.now();
+        await page.goto(
+          `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
+          { waitUntil: "domcontentloaded", timeout: 30000 }
+        );
+        log(
+          `recherche "${searchTerm}" chargée en ${Date.now() - tSearchStart}ms (essai ${attempt}/${MAX_SEARCH_ATTEMPTS})`
+        );
+
+        try {
+          const consentButton = page.getByRole("button", {
+            name: /tout accepter|j'accepte|accepter/i,
+          });
+          await consentButton.click({ timeout: 4000 });
+          log("bandeau de consentement accepté");
+        } catch {
+          // pas de bandeau
+        }
+
+        // Google peut afficher la page de recherche alors que le conteneur
+        // `role="feed"` n'est pas encore "visible" pour Playwright (overlay,
+        // consentement, rendu progressif de Maps). Attendre uniquement
+        // `visible` provoquait des faux timeouts alors que la page était bien
+        // chargée. On accepte donc soit le feed attaché, soit la présence
+        // d'une première fiche, puis on vérifie que Google n'est plus sur la
+        // page de consentement.
+        await page.waitForTimeout(800);
+
+        if (/consent\.google\.com/i.test(page.url())) {
+          log("encore sur consent.google.com après acceptation — nouvelle navigation");
+          await page.goto(
+            `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
+            { waitUntil: "domcontentloaded", timeout: 30000 }
+          );
+        }
+
+        const firstPlaceLink = page.locator('a[href*="/maps/place/"]').first();
+
+        await Promise.race([
+          feed.waitFor({ state: "attached", timeout: 15000 }),
+          firstPlaceLink.waitFor({ state: "attached", timeout: 15000 }),
+        ]);
+
+        // Le feed peut être attaché avant d'être visible : on ne bloque pas
+        // inutilement sur son état "visible". La boucle suivante vérifiera
+        // directement les liens réellement présents.
+        const feedAttached = await feed.count().catch(() => 0);
+        const placeLinks = await page.locator('a[href*="/maps/place/"]').count().catch(() => 0);
+
+        if (feedAttached === 0 && placeLinks === 0) {
+          throw new Error("Google Maps chargé mais aucun feed/lien de fiche détecté");
+        }
+
+        log(`feed prêt (${placeLinks} liens fiche détectés)`);
+        break; // feed trouvé, on sort de la boucle de tentatives
+      } catch (err) {
+        if (attempt >= MAX_SEARCH_ATTEMPTS) throw err;
+        log(
+          `échec chargement recherche/feed (essai ${attempt}/${MAX_SEARCH_ATTEMPTS}) — ${
+            err instanceof Error ? err.message : String(err)
+          } — nouvel essai dans 3s`
+        );
+        await page.waitForTimeout(3000);
+      }
+    }
 
     let stagnantRounds = 0;
     let lastHrefCount = 0;
@@ -263,7 +418,11 @@ export async function scanGoogleMaps(
         // en entier : la page principale ne quitte plus jamais cette vue,
         // mais ça reste la lecture la plus fiable si Maps ajoute des
         // liens "/maps/place/" ailleurs sur la page (pub, panneau latéral).
-        hrefs = await feed
+        const linkRoot = (await feed.count().catch(() => 0)) > 0
+          ? feed
+          : page.locator('div[role="main"]');
+
+        hrefs = await linkRoot
           .locator('a[href*="/maps/place/"]')
           .evaluateAll((els) => els.map((e) => (e as HTMLAnchorElement).href));
       } catch {
@@ -305,6 +464,28 @@ export async function scanGoogleMaps(
         if (listing) {
           const { keepGoing } = await onListing(listing);
           if (!keepGoing) return "target_reached";
+
+          if (!known) {
+            listingsThisSession++;
+
+            const { overThreshold, memInfo } = checkMemoryThreshold();
+            const overHardCeiling = listingsThisSession >= HARD_RECYCLE_CEILING;
+
+            if (overThreshold || overHardCeiling) {
+              log(
+                `recyclage du navigateur après ${listingsThisSession} fiches — ${
+                  overThreshold ? memInfo : "mémoire non lisible, plafond fixe atteint"
+                } — relance de la recherche`
+              );
+              return "recycle";
+            }
+
+            // Petite pause aléatoire entre deux fiches : ça laisse le temps
+            // à Chromium de faire un peu de ménage entre deux ouvertures,
+            // et ça réduit le rythme de scraping (plus dur à détecter côté
+            // Google que 1 fiche toutes les 1-3s en continu).
+            await page.waitForTimeout(700 + Math.floor(Math.random() * 900));
+          }
         }
       }
 
@@ -326,6 +507,23 @@ export async function scanGoogleMaps(
           return "error";
         }
       }
+
+      // Vérifie la mémoire aussi ici, pas seulement après une fiche ouverte :
+      // le scroll seul (chargement de nouvelles tuiles de carte, nouvelles
+      // cartes de résultats dans le feed) peut faire grimper la mémoire
+      // jusqu'au seuil, voire au-delà, avant même que la prochaine fiche
+      // ne soit ouverte et ne déclenche le check habituel. C'est exactement
+      // ce qui s'est produit sur le crash avec 104 liens accumulés en 7
+      // tours de scroll, jamais vérifiés entre-temps.
+      const { overThreshold: overThresholdAfterScroll, memInfo: memInfoAfterScroll } =
+        checkMemoryThreshold();
+      if (overThresholdAfterScroll) {
+        log(
+          `recyclage du navigateur après le tour ${round} (scroll) — ${memInfoAfterScroll} — relance de la recherche`
+        );
+        return "recycle";
+      }
+
       await page.waitForTimeout(900);
       log(
         `tour ${round} terminé en ${Date.now() - tRoundStart}ms (scroll: ${Date.now() - tScrollStart}ms)`
@@ -333,5 +531,24 @@ export async function scanGoogleMaps(
     }
   } finally {
     await browser.close();
+  }
+}
+
+export async function scanGoogleMaps(
+  activite: string,
+  zone: string,
+  onListing: (listing: ScrapedListing) => Promise<{ keepGoing: boolean }>,
+  options?: { isKnownUrl?: (url: string) => Promise<boolean> }
+): Promise<ScanOutcome> {
+  // `visited` vit en dehors des sessions : après un recyclage, le nouveau
+  // navigateur repart de zéro sur Google Maps mais ignore instantanément
+  // tout ce qui a déjà été vu, sans même repasser par la vérification
+  // "déjà connue" en base.
+  const visited = new Set<string>();
+
+  while (true) {
+    const outcome = await runOneSession(activite, zone, visited, onListing, options);
+    if (outcome === "recycle") continue;
+    return outcome;
   }
 }
