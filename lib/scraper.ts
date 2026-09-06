@@ -1,24 +1,29 @@
-import { chromium, type BrowserContext, type Page } from "playwright";
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Page,
+  type Locator,
+} from "playwright";
 
 // Scraper Google Maps — moteur de découverte incrémentale.
 //
-// scanGoogleMaps continue de faire défiler la zone tant que le callback
-// `onListing` répond { keepGoing: true }.
-//
 // Robustesse :
 // - une fiche individuelle qui échoue ne tue pas le scan ;
-// - les lectures du feed sont retentées avant abandon ;
+// - les lectures du feed sont retentées ;
 // - isKnownUrl est protégé contre les erreurs temporaires ;
-// - onListing est protégé contre les erreurs pour éviter qu'une exception
-//   applicative fasse disparaître tout le scan sans diagnostic ;
-// - les erreurs réelles sont loguées avec leur stack pour identifier
-//   rapidement un problème Railway / DB / réseau / Playwright.
+// - onListing est protégé contre les erreurs ;
+// - les crashs Chromium sont détectés explicitement ;
+// - le navigateur est recyclé périodiquement pour limiter
+//   l'accumulation mémoire sur Railway ;
+// - en cas de crash du feed, Chromium est redémarré automatiquement ;
+// - visited est conservé pendant les redémarrages.
 //
 // IMPORTANT : la page principale (feed) ne navigue JAMAIS vers une fiche.
 // Chaque fiche est ouverte dans un onglet séparé puis refermée.
 //
 // ATTENTION :
-// - Contraire aux CGU de Google. Usage à tes risques (CAPTCHA, blocage IP).
+// - Contraire aux CGU de Google. Usage à tes risques.
 // - Sélecteurs CSS de Maps fragiles — à ajuster si nécessaire.
 
 export type ScrapedListing = {
@@ -32,19 +37,26 @@ export type ScrapedListing = {
   website: string | null;
   rating: number | null;
   reviewsCount: number | null;
-  /** true si la fiche n'a volontairement pas été rouverte (déjà connue). */
   skipped?: boolean;
 };
 
-export type ScanOutcome = "target_reached" | "zone_exhausted" | "error";
+export type ScanOutcome =
+  | "target_reached"
+  | "zone_exhausted"
+  | "error";
 
 function log(msg: string) {
-  console.log(`[scan ${new Date().toISOString().slice(11, 19)}] ${msg}`);
+  console.log(
+    `[scan ${new Date().toISOString().slice(11, 19)}] ${msg}`
+  );
 }
 
 function logError(context: string, err: unknown) {
-  const message = err instanceof Error ? err.message : String(err);
-  const stack = err instanceof Error ? err.stack : undefined;
+  const message =
+    err instanceof Error ? err.message : String(err);
+
+  const stack =
+    err instanceof Error ? err.stack : undefined;
 
   console.error(`[scan] ${context}: ${message}`);
 
@@ -54,20 +66,60 @@ function logError(context: string, err: unknown) {
 }
 
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return err instanceof Error
+    ? err.message
+    : String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function logMemory(label: string) {
+  const memory = process.memoryUsage();
+
+  const rss = Math.round(
+    memory.rss / 1024 / 1024
+  );
+
+  const heapUsed = Math.round(
+    memory.heapUsed / 1024 / 1024
+  );
+
+  const heapTotal = Math.round(
+    memory.heapTotal / 1024 / 1024
+  );
+
+  log(
+    `mémoire ${label} — RSS ${rss}MB, ` +
+      `heap ${heapUsed}/${heapTotal}MB`
+  );
 }
 
 function extractPostalCodeAndCity(
   address: string | null
-): { postalCode: string | null; city: string | null } {
+): {
+  postalCode: string | null;
+  city: string | null;
+} {
   if (!address) {
-    return { postalCode: null, city: null };
+    return {
+      postalCode: null,
+      city: null,
+    };
   }
 
-  const match = address.match(/(\d{5})\s+([A-Za-zÀ-ÿ\- ]+)/);
+  const match = address.match(
+    /(\d{5})\s+([A-Za-zÀ-ÿ\- ]+)/
+  );
 
   if (!match) {
-    return { postalCode: null, city: null };
+    return {
+      postalCode: null,
+      city: null,
+    };
   }
 
   return {
@@ -76,6 +128,9 @@ function extractPostalCodeAndCity(
   };
 }
 
+/**
+ * Extrait les données d'une fiche Google Maps.
+ */
 async function extractListingFromPage(
   page: Page,
   url: string
@@ -83,7 +138,9 @@ async function extractListingFromPage(
   const name = await page
     .locator("h1")
     .first()
-    .innerText({ timeout: 5000 })
+    .innerText({
+      timeout: 5000,
+    })
     .catch(() => "");
 
   if (!name) {
@@ -91,90 +148,168 @@ async function extractListingFromPage(
   }
 
   const address = await page
-    .locator('button[data-item-id^="address"]')
+    .locator(
+      'button[data-item-id^="address"]'
+    )
     .first()
-    .getAttribute("aria-label", { timeout: 3000 })
+    .getAttribute("aria-label", {
+      timeout: 3000,
+    })
     .then(
       (value) =>
-        value?.replace(/^Adresse\s*:\s*/i, "").trim() ?? null
+        value
+          ?.replace(/^Adresse\s*:\s*/i, "")
+          .trim() ?? null
     )
     .catch(() => null);
 
   const phone = await page
-    .locator('button[data-item-id^="phone:tel:"]')
+    .locator(
+      'button[data-item-id^="phone:tel:"]'
+    )
     .first()
-    .getAttribute("aria-label", { timeout: 3000 })
+    .getAttribute("aria-label", {
+      timeout: 3000,
+    })
     .then(
       (value) =>
-        value?.replace(/^[^\d+]+/, "").trim() ?? null
+        value
+          ?.replace(/^[^\d+]+/, "")
+          .trim() ?? null
     )
     .catch(() => null);
 
   const website = await page
-    .locator('a[data-item-id="authority"]')
+    .locator(
+      'a[data-item-id="authority"]'
+    )
     .first()
-    .getAttribute("href", { timeout: 3000 })
+    .getAttribute("href", {
+      timeout: 3000,
+    })
     .catch(() => null);
 
   const category = await page
-    .locator('button[jsaction*="category"]')
+    .locator(
+      'button[jsaction*="category"]'
+    )
     .first()
-    .innerText({ timeout: 3000 })
+    .innerText({
+      timeout: 3000,
+    })
     .catch(() => null);
 
   const ratingText = await page
-    .locator('div.F7nice span[aria-hidden="true"]')
+    .locator(
+      'div.F7nice span[aria-hidden="true"]'
+    )
     .first()
-    .innerText({ timeout: 3000 })
+    .innerText({
+      timeout: 3000,
+    })
     .catch(() => null);
 
   const rating = ratingText
-    ? parseFloat(ratingText.replace(",", "."))
+    ? parseFloat(
+        ratingText.replace(",", ".")
+      )
     : null;
 
   const reviewsRaw = await page
-    .locator('div.F7nice span[aria-label*="avis"]')
+    .locator(
+      'div.F7nice span[aria-label*="avis"]'
+    )
     .first()
-    .getAttribute("aria-label", { timeout: 3000 })
+    .getAttribute("aria-label", {
+      timeout: 3000,
+    })
     .catch(() => null);
 
-  const reviewsMatch = reviewsRaw?.match(/(\d[\d\s]*)/);
+  const reviewsMatch =
+    reviewsRaw?.match(/(\d[\d\s]*)/);
 
   const reviewsCount = reviewsMatch
-    ? parseInt(reviewsMatch[1].replace(/\s/g, ""), 10)
+    ? parseInt(
+        reviewsMatch[1].replace(/\s/g, ""),
+        10
+      )
     : null;
 
-  const { postalCode, city } =
-    extractPostalCodeAndCity(address);
+  const {
+    postalCode,
+    city,
+  } = extractPostalCodeAndCity(address);
 
   return {
     googleMapsUrl: url,
     name: name.trim(),
-    category: category?.trim() || null,
+    category:
+      category?.trim() || null,
     address,
     city,
     postalCode,
     phone,
     website,
-    rating: Number.isFinite(rating) ? rating : null,
+    rating:
+      Number.isFinite(rating)
+        ? rating
+        : null,
     reviewsCount,
   };
 }
 
 /**
- * Ouvre une fiche dans un onglet dédié, l'extrait, puis referme l'onglet.
+ * Bloque les ressources lourdes uniquement sur les fiches.
  *
- * Une erreur sur cette fiche ne tue JAMAIS le scan complet.
+ * On NE bloque PAS les scripts, stylesheets ou XHR :
+ * Google Maps peut en avoir besoin pour afficher les données.
+ */
+async function optimizeDetailPage(
+  page: Page
+): Promise<void> {
+  await page.route(
+    "**/*",
+    async (route) => {
+      try {
+        const resourceType =
+          route.request().resourceType();
+
+        if (
+          resourceType === "image" ||
+          resourceType === "media" ||
+          resourceType === "font"
+        ) {
+          await route.abort();
+          return;
+        }
+
+        await route.continue();
+      } catch {
+        // La page peut déjà être morte.
+      }
+    }
+  );
+}
+
+/**
+ * Ouvre une fiche dans un onglet dédié,
+ * l'extrait, puis referme l'onglet.
+ *
+ * Une erreur sur cette fiche ne tue JAMAIS
+ * le scan complet.
  */
 async function extractListing(
   context: BrowserContext,
   url: string
 ): Promise<ScrapedListing | null> {
   const t0 = Date.now();
+
   let detailPage: Page | null = null;
 
   try {
     detailPage = await context.newPage();
+
+    await optimizeDetailPage(detailPage);
 
     const tGotoStart = Date.now();
 
@@ -183,50 +318,62 @@ async function extractListing(
       timeout: 20000,
     });
 
-    const gotoMs = Date.now() - tGotoStart;
+    const gotoMs =
+      Date.now() - tGotoStart;
 
-    await detailPage.waitForTimeout(500);
+    // Pas de page.waitForTimeout :
+    // un renderer mort peut provoquer exactement
+    // "page.waitForTimeout: Page crashed".
+    await sleep(500);
 
-    const result = await extractListingFromPage(
-      detailPage,
-      url
-    );
+    const result =
+      await extractListingFromPage(
+        detailPage,
+        url
+      );
 
     if (result) {
       log(
-        `✓ fiche "${result.name}" — goto ${gotoMs}ms, total ${
-          Date.now() - t0
-        }ms`
+        `✓ fiche "${result.name}" — ` +
+          `goto ${gotoMs}ms, total ${
+            Date.now() - t0
+          }ms`
       );
     } else {
       log(
-        `⚠ fiche illisible — total ${Date.now() - t0}ms`
+        `⚠ fiche illisible — total ${
+          Date.now() - t0
+        }ms`
       );
     }
 
     return result;
   } catch (err) {
     logError(
-      `échec extraction fiche après ${Date.now() - t0}ms`,
+      `échec extraction fiche après ${
+        Date.now() - t0
+      }ms`,
       err
     );
 
     return null;
   } finally {
     if (detailPage) {
-      await detailPage.close().catch(() => {});
+      await detailPage
+        .close()
+        .catch(() => {});
     }
   }
 }
 
 /**
- * Fait défiler le feed avec un vrai geste de molette positionné sur la
- * dernière fiche visible.
+ * Fait défiler le feed avec un vrai geste
+ * de molette positionné sur la dernière fiche visible.
  */
 async function scrollFeed(
   page: Page,
-  feed: import("playwright").Locator
-) {
+  feed: Locator
+): Promise<void> {
   const cards = feed.locator(
     'a[href*="/maps/place/"]'
   );
@@ -237,13 +384,15 @@ async function scrollFeed(
 
   if (cardCount > 0) {
     try {
-      const lastCard = cards.nth(cardCount - 1);
+      const lastCard =
+        cards.nth(cardCount - 1);
 
       await lastCard.scrollIntoViewIfNeeded({
         timeout: 3000,
       });
 
-      const box = await lastCard.boundingBox();
+      const box =
+        await lastCard.boundingBox();
 
       if (box) {
         await page.mouse.move(
@@ -258,35 +407,43 @@ async function scrollFeed(
 
   await page.mouse.wheel(0, 900);
 
-  await page.waitForTimeout(250);
+  await sleep(250);
 
   await page.mouse.wheel(0, 900);
 
   await feed
-    .evaluate((el) => el.scrollBy(0, 1200))
+    .evaluate((el) => {
+      el.scrollBy(0, 1200);
+    })
     .catch(() => {});
 }
 
 /**
  * Lit les URLs du feed avec plusieurs tentatives.
- *
- * Maps peut temporairement reconstruire le DOM pendant un scroll.
- * Une erreur ponctuelle ne doit donc pas tuer le scan.
  */
 async function readFeedUrls(
-  feed: import("playwright").Locator,
+  feed: Locator,
   attempts = 4
 ): Promise<string[]> {
   let lastError: unknown = null;
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (
+    let attempt = 1;
+    attempt <= attempts;
+    attempt++
+  ) {
     try {
       const hrefs = await feed
-        .locator('a[href*="/maps/place/"]')
+        .locator(
+          'a[href*="/maps/place/"]'
+        )
         .evaluateAll((els) =>
           els
-            .map((element) =>
-              (element as HTMLAnchorElement).href
+            .map(
+              (element) =>
+                (
+                  element as HTMLAnchorElement
+                ).href
             )
             .filter(Boolean)
         );
@@ -296,9 +453,7 @@ async function readFeedUrls(
       lastError = err;
 
       if (attempt < attempts) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, 1500)
-        );
+        await sleep(1500);
       }
     }
   }
@@ -307,13 +462,15 @@ async function readFeedUrls(
 }
 
 /**
- * Vérifie une URL connue avec quelques retries.
+ * Vérifie une URL connue avec retries.
  *
- * On ne considère jamais une erreur DB/réseau comme "URL inconnue",
- * afin d'éviter d'insérer accidentellement des doublons.
+ * Une erreur DB/réseau n'est jamais considérée
+ * comme "URL inconnue".
  */
 async function checkKnownUrl(
-  isKnownUrl: ((url: string) => Promise<boolean>) | undefined,
+  isKnownUrl:
+    | ((url: string) => Promise<boolean>)
+    | undefined,
   url: string
 ): Promise<boolean> {
   if (!isKnownUrl) {
@@ -322,7 +479,11 @@ async function checkKnownUrl(
 
   let lastError: unknown = null;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (
+    let attempt = 1;
+    attempt <= 3;
+    attempt++
+  ) {
     try {
       return await isKnownUrl(url);
     } catch (err) {
@@ -334,9 +495,7 @@ async function checkKnownUrl(
       );
 
       if (attempt < 3) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, 1000 * attempt)
-        );
+        await sleep(1000 * attempt);
       }
     }
   }
@@ -344,137 +503,295 @@ async function checkKnownUrl(
   throw lastError;
 }
 
-export async function scanGoogleMaps(
-  activite: string,
-  zone: string,
-  onListing: (
-    listing: ScrapedListing
-  ) => Promise<{ keepGoing: boolean }>,
-  options?: {
-    isKnownUrl?: (url: string) => Promise<boolean>;
-  }
-): Promise<ScanOutcome> {
-  let browser: Awaited<
-    ReturnType<typeof chromium.launch>
-  > | null = null;
+type BrowserSession = {
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+  feed: Locator;
+  crashed: boolean;
+};
 
-  let context: BrowserContext | null = null;
-  let page: Page | null = null;
-
-  const visited = new Set<string>();
-
-  try {
-    // ------------------------------------------------------------
-    // 1. Chromium
-    // ------------------------------------------------------------
-
-    browser = await chromium.launch({
+/**
+ * Lance une nouvelle session Chromium et ouvre
+ * la recherche Google Maps.
+ */
+async function createBrowserSession(
+  searchUrl: string
+): Promise<BrowserSession> {
+  const browser =
+    await chromium.launch({
       headless: true,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+
+        // Réduisent certaines activités secondaires
+        // de Chromium sur un serveur headless.
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-translate",
       ],
     });
 
-    context = await browser.newContext({
+  let crashed = false;
+
+  browser.on("disconnected", () => {
+    crashed = true;
+
+    log(
+      "⚠ Chromium déconnecté"
+    );
+  });
+
+  const context =
+    await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/124.0 Safari/537.36",
+
       viewport: {
         width: 1366,
         height: 900,
       },
+
       locale: "fr-FR",
     });
 
-    page = await context.newPage();
+  const page =
+    await context.newPage();
 
-    // ------------------------------------------------------------
-    // 2. Recherche Google Maps
-    // ------------------------------------------------------------
+  page.on("crash", () => {
+    crashed = true;
 
-    const searchTerm = `${activite} ${zone}`;
+    log(
+      "💥 CRASH DU RENDERER DE LA PAGE GOOGLE MAPS"
+    );
+  });
 
-    const searchUrl =
-      `https://www.google.com/maps/search/` +
-      `${encodeURIComponent(searchTerm)}?hl=fr`;
+  await page.goto(searchUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 30000,
+  });
 
-    const tSearchStart = Date.now();
+  log("recherche Google Maps chargée");
 
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
+  // ------------------------------------------------------------
+  // Consentement
+  // ------------------------------------------------------------
+
+  try {
+    const consentButton =
+      page.getByRole("button", {
+        name:
+          /tout accepter|j'accepte|accepter/i,
+      });
+
+    await consentButton.click({
+      timeout: 4000,
     });
 
     log(
-      `recherche "${searchTerm}" chargée en ${
-        Date.now() - tSearchStart
-      }ms`
+      "bandeau de consentement accepté"
+    );
+  } catch {
+    // Aucun bandeau : normal.
+  }
+
+  // ------------------------------------------------------------
+  // Feed
+  // ------------------------------------------------------------
+
+  const feed = page.locator(
+    'div[role="feed"]'
+  );
+
+  await feed.waitFor({
+    timeout: 15000,
+  });
+
+  log(
+    "feed Google Maps détecté"
+  );
+
+  return {
+    browser,
+    context,
+    page,
+    feed,
+    crashed,
+  };
+}
+
+/**
+ * Ferme proprement une session Chromium.
+ */
+async function closeBrowserSession(
+  session: BrowserSession | null
+): Promise<void> {
+  if (!session) {
+    return;
+  }
+
+  await session.page
+    .close()
+    .catch(() => {});
+
+  await session.context
+    .close()
+    .catch(() => {});
+
+  await session.browser
+    .close()
+    .catch(() => {});
+}
+
+export async function scanGoogleMaps(
+  activite: string,
+  zone: string,
+  onListing: (
+    listing: ScrapedListing
+  ) => Promise<{
+    keepGoing: boolean;
+  }>,
+  options?: {
+    isKnownUrl?: (
+      url: string
+    ) => Promise<boolean>;
+  }
+): Promise<ScanOutcome> {
+  const visited = new Set<string>();
+
+  let session:
+    | BrowserSession
+    | null = null;
+
+  let round = 0;
+
+  let stagnantRounds = 0;
+
+  let lastHrefCount = 0;
+
+  let consecutiveFailures = 0;
+
+  let recoveryCount = 0;
+
+  let processedSinceRecycle = 0;
+
+  // ------------------------------------------------------------
+  // Limites de sécurité
+  // ------------------------------------------------------------
+
+  // On recycle Chromium régulièrement.
+  // Cela évite de garder un renderer Google Maps vivant
+  // pendant plusieurs centaines de fiches.
+  const RECYCLE_EVERY = 40;
+
+  // Évite une boucle infinie si Railway/Chromium
+  // est réellement incapable de tenir le scan.
+  const MAX_RECOVERIES = 3;
+
+  const searchTerm =
+    `${activite} ${zone}`;
+
+  const searchUrl =
+    `https://www.google.com/maps/search/` +
+    `${encodeURIComponent(searchTerm)}?hl=fr`;
+
+  try {
+    log(
+      `début scan "${searchTerm}"`
     );
 
-    // ------------------------------------------------------------
-    // 3. Consentement
-    // ------------------------------------------------------------
+    logMemory("début");
 
-    try {
-      const consentButton = page.getByRole(
-        "button",
-        {
-          name: /tout accepter|j'accepte|accepter/i,
-        }
+    // ----------------------------------------------------------
+    // Première session Chromium
+    // ----------------------------------------------------------
+
+    session =
+      await createBrowserSession(
+        searchUrl
       );
 
-      await consentButton.click({
-        timeout: 4000,
-      });
-
-      log("bandeau de consentement accepté");
-    } catch {
-      // Aucun bandeau : normal.
-    }
-
-    // ------------------------------------------------------------
-    // 4. Feed
-    // ------------------------------------------------------------
-
-    const feed = page.locator(
-      'div[role="feed"]'
-    );
-
-    await feed.waitFor({
-      timeout: 15000,
-    });
-
-    log("feed Google Maps détecté");
-
-    // ------------------------------------------------------------
-    // 5. État du scan
-    // ------------------------------------------------------------
-
-    let stagnantRounds = 0;
-    let lastHrefCount = 0;
-    let consecutiveFailures = 0;
-    let round = 0;
-
-    // ------------------------------------------------------------
-    // 6. Boucle principale
-    // ------------------------------------------------------------
+    // ----------------------------------------------------------
+    // Boucle principale
+    // ----------------------------------------------------------
 
     while (true) {
       round++;
 
-      const tRoundStart = Date.now();
+      const tRoundStart =
+        Date.now();
 
-      // ----------------------------------------------------------
-      // Lecture des fiches visibles
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
+      // Vérification du renderer
+      // --------------------------------------------------------
+
+      if (
+        session.crashed ||
+        session.page.isClosed()
+      ) {
+        recoveryCount++;
+
+        log(
+          `💥 feed Chromium mort — ` +
+            `récupération ${recoveryCount}/${MAX_RECOVERIES}`
+        );
+
+        if (
+          recoveryCount > MAX_RECOVERIES
+        ) {
+          log(
+            "scan arrêté : trop de crashs Chromium"
+          );
+
+          return "error";
+        }
+
+        await closeBrowserSession(
+          session
+        );
+
+        session = null;
+
+        await sleep(2000);
+
+        session =
+          await createBrowserSession(
+            searchUrl
+          );
+
+        // Le feed repart du début.
+        // visited est conservé, donc les anciennes
+        // fiches ne seront pas retraitées.
+        stagnantRounds = 0;
+        lastHrefCount = 0;
+        consecutiveFailures = 0;
+
+        log(
+          `✓ Chromium redémarré — ` +
+            `${visited.size} fiches déjà visitées conservées`
+        );
+
+        continue;
+      }
+
+      // --------------------------------------------------------
+      // Lecture du feed
+      // --------------------------------------------------------
 
       let hrefs: string[];
 
       try {
-        hrefs = await readFeedUrls(feed, 4);
+        hrefs = await readFeedUrls(
+          session.feed,
+          4
+        );
 
         consecutiveFailures = 0;
       } catch (err) {
@@ -486,78 +803,126 @@ export async function scanGoogleMaps(
           err
         );
 
-        if (consecutiveFailures >= 4) {
+        // Si c'est un crash renderer, on ne perd
+        // pas de temps avec 4 retries inutiles.
+        if (
+          session.crashed ||
+          errorMessage(err).includes(
+            "Page crashed"
+          )
+        ) {
+          recoveryCount++;
+
           log(
-            `scan arrêté : impossible de lire le feed après 4 tentatives`
+            `💥 crash détecté pendant lecture feed — ` +
+              `récupération ${recoveryCount}/${MAX_RECOVERIES}`
+          );
+
+          if (
+            recoveryCount > MAX_RECOVERIES
+          ) {
+            return "error";
+          }
+
+          await closeBrowserSession(
+            session
+          );
+
+          session = null;
+
+          await sleep(2000);
+
+          session =
+            await createBrowserSession(
+              searchUrl
+            );
+
+          stagnantRounds = 0;
+          lastHrefCount = 0;
+          consecutiveFailures = 0;
+
+          continue;
+        }
+
+        if (
+          consecutiveFailures >= 4
+        ) {
+          log(
+            "scan arrêté : impossible de lire le feed après 4 tentatives"
           );
 
           return "error";
         }
 
-        await page.waitForTimeout(3000);
+        await sleep(3000);
 
         continue;
       }
 
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
       // Nouvelles URLs
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
 
       const fresh = hrefs.filter(
-        (url) => !visited.has(url)
+        (url) =>
+          !visited.has(url)
       );
 
       log(
-        `tour ${round} : ${hrefs.length} liens visibles, ` +
+        `tour ${round} : ` +
+          `${hrefs.length} liens visibles, ` +
           `${fresh.length} nouveaux`
       );
 
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
       // Traitement des fiches
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
 
       for (const url of fresh) {
         visited.add(url);
 
-        // --------------------------------------------------------
-        // Vérification "déjà connue"
-        // --------------------------------------------------------
+        // ------------------------------------------------------
+        // Vérification URL connue
+        // ------------------------------------------------------
 
         let known = false;
 
         try {
-          const tKnownStart = Date.now();
+          const tKnownStart =
+            Date.now();
 
-          known = await checkKnownUrl(
-            options?.isKnownUrl,
-            url
-          );
+          known =
+            await checkKnownUrl(
+              options?.isKnownUrl,
+              url
+            );
 
           const knownMs =
-            Date.now() - tKnownStart;
+            Date.now() -
+            tKnownStart;
 
           if (knownMs > 1000) {
             log(
-              `vérification déjà connue lente : ${knownMs}ms`
+              `vérification déjà connue lente : ` +
+                `${knownMs}ms`
             );
           }
         } catch (err) {
-          // IMPORTANT :
-          // On arrête plutôt que de considérer la fiche comme nouvelle.
-          // Sinon une panne DB peut provoquer des doublons.
           logError(
-            `impossible de vérifier si la fiche est déjà connue`,
+            "impossible de vérifier si la fiche est déjà connue",
             err
           );
 
           return "error";
         }
 
-        // --------------------------------------------------------
+        // ------------------------------------------------------
         // Extraction
-        // --------------------------------------------------------
+        // ------------------------------------------------------
 
-        let listing: ScrapedListing | null;
+        let listing:
+          | ScrapedListing
+          | null;
 
         if (known) {
           listing = {
@@ -574,68 +939,196 @@ export async function scanGoogleMaps(
             skipped: true,
           };
         } else {
-          listing = await extractListing(
-            context,
-            url
-          );
+          listing =
+            await extractListing(
+              session.context,
+              url
+            );
         }
 
-        // --------------------------------------------------------
-        // Callback applicatif
-        // --------------------------------------------------------
+        processedSinceRecycle++;
+
+        // ------------------------------------------------------
+        // Fiche illisible
+        // ------------------------------------------------------
 
         if (!listing) {
-          // Une fiche Google Maps illisible ne doit PAS tuer le scan.
           continue;
         }
 
-        try {
-          const result = await onListing(
-            listing
-          );
+        // ------------------------------------------------------
+        // Callback applicatif
+        // ------------------------------------------------------
 
-          if (!result || typeof result.keepGoing !== "boolean") {
+        try {
+          const result =
+            await onListing(
+              listing
+            );
+
+          if (
+            !result ||
+            typeof result.keepGoing !==
+              "boolean"
+          ) {
             log(
-              `onListing a retourné une réponse invalide`
+              "onListing a retourné une réponse invalide"
             );
 
             return "error";
           }
 
-          if (!result.keepGoing) {
+          if (
+            !result.keepGoing
+          ) {
             log(
-              `objectif atteint après ${visited.size} fiches consultées`
+              `objectif atteint après ` +
+                `${visited.size} fiches consultées`
             );
 
             return "target_reached";
           }
         } catch (err) {
-          // C'est extrêmement important :
-          // avant, une exception de onListing pouvait remonter
-          // directement jusqu'au niveau supérieur et transformer
-          // le scan en simple "problème technique".
           logError(
-            `ERREUR DANS onListing pour la fiche "${listing.name || "?"}"`,
+            `ERREUR DANS onListing pour la fiche ` +
+              `"${listing.name || "?"}"`,
             err
           );
 
           return "error";
         }
+
+        // ------------------------------------------------------
+        // Recyclage préventif Chromium
+        // ------------------------------------------------------
+
+        if (
+          processedSinceRecycle >=
+          RECYCLE_EVERY
+        ) {
+          log(
+            `♻ recyclage préventif Chromium après ` +
+              `${processedSinceRecycle} fiches`
+          );
+
+          logMemory(
+            "avant recyclage"
+          );
+
+          await closeBrowserSession(
+            session
+          );
+
+          session = null;
+
+          await sleep(1500);
+
+          try {
+            session =
+              await createBrowserSession(
+                searchUrl
+              );
+
+            processedSinceRecycle = 0;
+
+            stagnantRounds = 0;
+            lastHrefCount = 0;
+
+            log(
+              `✓ Chromium recyclé — ` +
+                `${visited.size} fiches conservées`
+            );
+
+            logMemory(
+              "après recyclage"
+            );
+          } catch (err) {
+            logError(
+              "échec du recyclage Chromium",
+              err
+            );
+
+            return "error";
+          }
+        }
+
+        // ------------------------------------------------------
+        // Si le feed a crashé pendant l'extraction
+        // ------------------------------------------------------
+
+        if (
+          session.crashed ||
+          session.page.isClosed()
+        ) {
+          recoveryCount++;
+
+          log(
+            `💥 crash du feed détecté après traitement ` +
+              `de ${visited.size} fiches — ` +
+              `récupération ${recoveryCount}/${MAX_RECOVERIES}`
+          );
+
+          if (
+            recoveryCount > MAX_RECOVERIES
+          ) {
+            return "error";
+          }
+
+          await closeBrowserSession(
+            session
+          );
+
+          session = null;
+
+          await sleep(2000);
+
+          session =
+            await createBrowserSession(
+              searchUrl
+            );
+
+          stagnantRounds = 0;
+          lastHrefCount = 0;
+          consecutiveFailures = 0;
+
+          break;
+        }
       }
 
-      // ----------------------------------------------------------
-      // Détection de zone épuisée
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
+      // Si la session a été recyclée/crashée pendant le tour
+      // --------------------------------------------------------
 
-      if (hrefs.length === lastHrefCount) {
+      if (!session) {
+        continue;
+      }
+
+      if (
+        session.crashed ||
+        session.page.isClosed()
+      ) {
+        continue;
+      }
+
+      // --------------------------------------------------------
+      // Détection de zone épuisée
+      // --------------------------------------------------------
+
+      if (
+        hrefs.length ===
+        lastHrefCount
+      ) {
         stagnantRounds++;
       } else {
         stagnantRounds = 0;
       }
 
-      lastHrefCount = hrefs.length;
+      lastHrefCount =
+        hrefs.length;
 
-      if (stagnantRounds >= 6) {
+      if (
+        stagnantRounds >= 6
+      ) {
         log(
           `zone épuisée après ${round} tours`
         );
@@ -643,14 +1136,18 @@ export async function scanGoogleMaps(
         return "zone_exhausted";
       }
 
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
       // Scroll
-      // ----------------------------------------------------------
+      // --------------------------------------------------------
 
-      const tScrollStart = Date.now();
+      const tScrollStart =
+        Date.now();
 
       try {
-        await scrollFeed(page, feed);
+        await scrollFeed(
+          session.page,
+          session.feed
+        );
 
         consecutiveFailures = 0;
       } catch (err) {
@@ -662,36 +1159,127 @@ export async function scanGoogleMaps(
           err
         );
 
-        if (consecutiveFailures >= 4) {
+        // Crash du renderer = récupération immédiate.
+        if (
+          session.crashed ||
+          session.page.isClosed() ||
+          errorMessage(err).includes(
+            "Page crashed"
+          )
+        ) {
+          recoveryCount++;
+
           log(
-            `scan arrêté : scroll impossible après 4 tentatives`
+            `💥 crash pendant scroll — ` +
+              `récupération ${recoveryCount}/${MAX_RECOVERIES}`
+          );
+
+          if (
+            recoveryCount > MAX_RECOVERIES
+          ) {
+            return "error";
+          }
+
+          await closeBrowserSession(
+            session
+          );
+
+          session = null;
+
+          await sleep(2000);
+
+          session =
+            await createBrowserSession(
+              searchUrl
+            );
+
+          stagnantRounds = 0;
+          lastHrefCount = 0;
+          consecutiveFailures = 0;
+
+          continue;
+        }
+
+        if (
+          consecutiveFailures >= 4
+        ) {
+          log(
+            "scan arrêté : scroll impossible après 4 tentatives"
           );
 
           return "error";
         }
       }
 
-      await page.waitForTimeout(900);
+      // IMPORTANT :
+      // Ne plus utiliser page.waitForTimeout ici.
+      //
+      // Si Chromium vient de mourir pendant le scroll,
+      // waitForTimeout() lui-même déclenche :
+      // "page.waitForTimeout: Page crashed"
+      await sleep(900);
+
+      if (
+        session.crashed ||
+        session.page.isClosed()
+      ) {
+        recoveryCount++;
+
+        log(
+          `💥 crash détecté après scroll — ` +
+            `récupération ${recoveryCount}/${MAX_RECOVERIES}`
+        );
+
+        if (
+          recoveryCount > MAX_RECOVERIES
+        ) {
+          return "error";
+        }
+
+        await closeBrowserSession(
+          session
+        );
+
+        session = null;
+
+        await sleep(2000);
+
+        session =
+          await createBrowserSession(
+            searchUrl
+          );
+
+        stagnantRounds = 0;
+        lastHrefCount = 0;
+        consecutiveFailures = 0;
+
+        continue;
+      }
 
       log(
-        `tour ${round} terminé en ${
-          Date.now() - tRoundStart
-        }ms ` +
+        `tour ${round} terminé en ` +
+          `${Date.now() - tRoundStart}ms ` +
           `(scroll: ${
             Date.now() - tScrollStart
           }ms)`
       );
+
+      // --------------------------------------------------------
+      // Monitoring mémoire
+      // --------------------------------------------------------
+
+      if (
+        round % 10 === 0
+      ) {
+        logMemory(
+          `tour ${round}`
+        );
+      }
     }
   } catch (err) {
-    // ------------------------------------------------------------
+    // ----------------------------------------------------------
     // ERREUR GLOBALE
-    // ------------------------------------------------------------
-    //
-    // Toute erreur qui aurait échappé aux protections précédentes
-    // est capturée ici avec sa vraie stack.
-    //
-    // L'interface peut continuer à afficher "problème technique",
-    // mais Railway aura maintenant la vraie cause dans les logs.
+    // ----------------------------------------------------------
 
     logError(
       "ERREUR FATALE DU SCAN",
@@ -700,20 +1288,16 @@ export async function scanGoogleMaps(
 
     return "error";
   } finally {
-    // ------------------------------------------------------------
+    // ----------------------------------------------------------
     // Nettoyage
-    // ------------------------------------------------------------
+    // ----------------------------------------------------------
 
-    if (page) {
-      await page.close().catch(() => {});
-    }
+    await closeBrowserSession(
+      session
+    );
 
-    if (context) {
-      await context.close().catch(() => {});
-    }
-
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    logMemory(
+      "fin"
+    );
   }
 }
