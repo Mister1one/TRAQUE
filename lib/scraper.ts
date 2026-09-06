@@ -301,25 +301,50 @@ async function runOneSession(
 
   try {
     const searchTerm = `${activite} ${zone}`;
-    const tSearchStart = Date.now();
-    await page.goto(
-      `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
-      { waitUntil: "domcontentloaded", timeout: 30000 }
-    );
-    log(`recherche "${searchTerm}" chargée en ${Date.now() - tSearchStart}ms`);
 
-    try {
-      const consentButton = page.getByRole("button", {
-        name: /tout accepter|j'accepte|accepter/i,
-      });
-      await consentButton.click({ timeout: 4000 });
-      log("bandeau de consentement accepté");
-    } catch {
-      // pas de bandeau
-    }
-
+    // Ouvre la recherche, accepte le bandeau de consentement, et attend le
+    // feed — le tout dans une fonction ré-essayable : après un recyclage,
+    // cette séquence peut ponctuellement échouer (Google redirige vers
+    // consent.google.com et ne revient pas à temps, coupure réseau...)
+    // sans que ça veuille dire que la recherche elle-même pose problème.
+    // Un simple nouvel essai (nouvelle navigation, sur la même page) suffit
+    // dans l'immense majorité des cas.
     const feed = page.locator('div[role="feed"]');
-    await feed.waitFor({ timeout: 15000 });
+    const MAX_SEARCH_ATTEMPTS = 3;
+
+    for (let attempt = 1; attempt <= MAX_SEARCH_ATTEMPTS; attempt++) {
+      try {
+        const tSearchStart = Date.now();
+        await page.goto(
+          `https://www.google.com/maps/search/${encodeURIComponent(searchTerm)}?hl=fr`,
+          { waitUntil: "domcontentloaded", timeout: 30000 }
+        );
+        log(
+          `recherche "${searchTerm}" chargée en ${Date.now() - tSearchStart}ms (essai ${attempt}/${MAX_SEARCH_ATTEMPTS})`
+        );
+
+        try {
+          const consentButton = page.getByRole("button", {
+            name: /tout accepter|j'accepte|accepter/i,
+          });
+          await consentButton.click({ timeout: 4000 });
+          log("bandeau de consentement accepté");
+        } catch {
+          // pas de bandeau
+        }
+
+        await feed.waitFor({ timeout: 15000 });
+        break; // feed trouvé, on sort de la boucle de tentatives
+      } catch (err) {
+        if (attempt >= MAX_SEARCH_ATTEMPTS) throw err;
+        log(
+          `échec chargement recherche/feed (essai ${attempt}/${MAX_SEARCH_ATTEMPTS}) — ${
+            err instanceof Error ? err.message : String(err)
+          } — nouvel essai dans 3s`
+        );
+        await page.waitForTimeout(3000);
+      }
+    }
 
     let stagnantRounds = 0;
     let lastHrefCount = 0;
