@@ -28,6 +28,22 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Un seul scan à la fois par utilisateur : deux Chromium headless
+  // en parallèle sur la même instance Railway saturent le CPU/RAM et
+  // font échouer les deux scans (timeouts en cascade).
+  const { data: activeScan } = await supabase
+    .from("scans")
+    .select("id")
+    .eq("status", "en_cours")
+    .maybeSingle();
+
+  if (activeScan) {
+    return NextResponse.json(
+      { error: "Un scan est déjà en cours. Attends qu'il se termine avant d'en lancer un nouveau." },
+      { status: 409 }
+    );
+  }
+
   const { data: scan, error } = await supabase
     .from("scans")
     .insert({ activite, zone, target, status: "en_cours" })

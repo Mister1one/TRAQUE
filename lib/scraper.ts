@@ -872,23 +872,36 @@ export async function scanGoogleMaps(
     logMemory("début");
 
     // ----------------------------------------------------------
-    // Première session
+    // Première session (avec retry : un cold start Chromium/Railway
+    // peut échouer ponctuellement sans que ce soit lié à la recherche)
     // ----------------------------------------------------------
 
-    try {
-      session =
-        await createBrowserSession(
-          searchUrl
-        );
-    } catch (err) {
-      logError(
-        "impossible de démarrer Chromium",
-        err
-      );
+    const FIRST_START_ATTEMPTS = 3;
+    let firstStartError: unknown = null;
 
-      return "error";
+    for (let attempt = 1; attempt <= FIRST_START_ATTEMPTS; attempt++) {
+      try {
+        session = await createBrowserSession(searchUrl);
+        firstStartError = null;
+        break;
+      } catch (err) {
+        firstStartError = err;
+
+        logError(
+          `échec démarrage Chromium (tentative ${attempt}/${FIRST_START_ATTEMPTS})`,
+          err
+        );
+
+        if (attempt < FIRST_START_ATTEMPTS) {
+          await sleep(2000);
+        }
+      }
     }
 
+    if (firstStartError) {
+      logError("impossible de démarrer Chromium après plusieurs tentatives", firstStartError);
+      return "error";
+    }
     // ----------------------------------------------------------
     // Boucle principale
     // ----------------------------------------------------------
