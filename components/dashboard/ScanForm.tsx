@@ -11,6 +11,8 @@ type Scan = {
   new_count: number;
   status: "en_cours" | "termine" | "zone_epuisee" | "erreur";
   message: string | null;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export default function ScanForm() {
@@ -58,6 +60,42 @@ export default function ScanForm() {
       cancelled = true;
       clearInterval(interval);
     };
+  }, []);
+
+  useEffect(() => {
+    async function resumeLatestScan() {
+      try {
+        const res = await fetch("/api/scans/latest");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.scan) return;
+
+        const latest: Scan = data.scan;
+
+        if (latest.status === "en_cours") {
+          // Scan toujours actif côté serveur : on reprend le suivi
+          // exactement comme si on venait de le lancer nous-mêmes.
+          setScan(latest);
+          pollScan(latest.id);
+          return;
+        }
+
+        // Scan déjà terminé (succès, zone épuisée, erreur) : on ne le
+        // réaffiche que s'il est récent, pour éviter de faire resurgir
+        // une vieille recherche à chaque rechargement de page des jours
+        // plus tard.
+        const RECENT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+        const updatedAt = new Date(latest.updated_at ?? latest.created_at ?? 0).getTime();
+        if (Date.now() - updatedAt < RECENT_WINDOW_MS) {
+          setScan(latest);
+        }
+      } catch {
+        // Silencieux : au pire l'utilisateur relance manuellement.
+      }
+    }
+
+    resumeLatestScan();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function pollScan(id: string) {
