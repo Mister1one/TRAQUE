@@ -45,12 +45,6 @@ export async function POST(req: NextRequest) {
       { status: 409 }
     );
   }
-  if (activeScan) {
-    return NextResponse.json(
-      { error: "Un scan est déjà en cours. Attends qu'il se termine avant d'en lancer un nouveau." },
-      { status: 409 }
-    );
-  }
 
   const { data: scan, error } = await supabase
     .from("scans")
