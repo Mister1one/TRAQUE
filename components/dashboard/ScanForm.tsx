@@ -21,6 +21,7 @@ export default function ScanForm() {
   const [starting, setStarting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
+  const [globalLocked, setGlobalLocked] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Un scan long met la machine sous charge et peut provoquer des hoquets
   // réseau/auth ponctuels (ex: 401 ou timeout isolé) sans que le scan côté
@@ -33,6 +34,29 @@ export default function ScanForm() {
   useEffect(() => {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkStatus() {
+      try {
+        const res = await fetch("/api/scans/status");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setGlobalLocked(!!data.locked);
+      } catch {
+        // Silencieux : ce n'est qu'un indicateur, pas une donnée critique.
+      }
+    }
+
+    checkStatus();
+    const interval = setInterval(checkStatus, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
     };
   }, []);
 
@@ -91,6 +115,7 @@ export default function ScanForm() {
   }
 
   const isRunning = scan?.status === "en_cours";
+  const lockedByOther = globalLocked && !isRunning;
   const progressPct = scan ? Math.min(100, Math.round((scan.new_count / scan.target) * 100)) : 0;
 
   return (
@@ -144,9 +169,16 @@ export default function ScanForm() {
           </p>
         )}
 
+        {lockedByOther && (
+          <p className="flex items-center justify-center gap-2 font-mono text-[11px] uppercase tracking-widest text-blaze">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-blaze" />
+            🔒 Quelqu'un utilise déjà la recherche dans TRAQUE en ce moment — réessaie dans quelques instants 🙂
+          </p>
+        )}
+
         <button
           type="submit"
-          disabled={starting || isRunning}
+          disabled={starting || isRunning || lockedByOther}
           className="btn-blaze w-full disabled:opacity-50"
         >
           {isRunning ? "Scan en cours..." : "Lancer le scan"}

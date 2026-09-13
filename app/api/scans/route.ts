@@ -8,6 +8,7 @@ export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
   const supabase = await getSupabaseServer();
+  const admin = getSupabaseAdmin();
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -31,7 +32,7 @@ export async function POST(req: NextRequest) {
   // Un seul scan à la fois par utilisateur : deux Chromium headless
   // en parallèle sur la même instance Railway saturent le CPU/RAM et
   // font échouer les deux scans (timeouts en cascade).
-  const { data: activeScans, error: activeScanError } = await supabase
+  const { data: activeScans, error: activeScanError } = await admin
     .from("scans")
     .select("id")
     .eq("status", "en_cours")
@@ -40,8 +41,8 @@ export async function POST(req: NextRequest) {
   if (activeScanError) {
     console.error("Erreur vérification scan actif :", activeScanError);
   } else if (activeScans && activeScans.length > 0) {
-    return NextResponse.json(
-      { error: "Un scan est déjà en cours. Attends qu'il se termine avant d'en lancer un nouveau." },
+     return NextResponse.json(
+      { error: "Quelqu'un utilise déjà la recherche dans TRAQUE en ce moment — réessaie dans quelques instants 🙂" },
       { status: 409 }
     );
   }
