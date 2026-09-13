@@ -898,7 +898,7 @@ export async function scanGoogleMaps(
       }
     }
 
-    if (firstStartError) {
+    if (!session) {
       logError("impossible de démarrer Chromium après plusieurs tentatives", firstStartError);
       return "error";
     }
