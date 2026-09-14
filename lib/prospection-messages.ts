@@ -271,3 +271,98 @@ export function messageText(angle: MessageAngle, canal: Canal): string {
   if (canal === "sms") return angle.sms;
   return `Objet : ${angle.email.objet}\n\n${angle.email.corps}`;
 }
+export type Ton = "premier_contact" | "amical" | "relance" | "pro";
+
+function constatFor(angleId: string, c: Company): string {
+  switch (angleId) {
+    case "pas_de_site":
+      return `${c.name} n'a pas de site actuellement`;
+    case "aucun_avis":
+      return `${c.name} n'a pas encore d'avis sur Google Maps`;
+    case "peu_davis":
+      return `${c.name} n'a que ${reviewsCount(c)} avis sur Google Maps`;
+    case "note_fragile":
+      return `la note de ${c.name} (${ratingValue(c)}/5) est en dessous de ce que regardent la plupart des clients avant de choisir`;
+    case "note_saine":
+      return `${c.name} a une bonne base (note à ${ratingValue(c)}/5) mais une présence en ligne qui pourrait ramener plus de monde`;
+    case "note_excellente":
+      return `${c.name} a une très bonne note (${ratingValue(c)}/5) sur Google, sans doute pas encore assez exploitée`;
+    case "preuve_sociale":
+      return `j'accompagne déjà plusieurs ${activite(c)} ${lieu(c)} sur leur visibilité en ligne`;
+    case "direct":
+      return `je cherche des ${activite(c)} ${lieu(c)} à accompagner sur leur visibilité en ligne, et ${c.name} correspond à ce que je recherche`;
+    default:
+      return `je suis tombé sur ${c.name} en cherchant des ${activite(c)} ${lieu(c)}`;
+  }
+}
+
+function smsFor(ton: Ton, constat: string): string {
+  switch (ton) {
+    case "premier_contact":
+      return `Bonjour, je me permets de vous contacter : ${constat}. J'ai une solution simple à vous montrer, 10 min cette semaine ?`;
+    case "amical":
+      return `Salut ! Je suis tombé sur votre fiche — ${constat}. Je peux vous montrer un truc simple qui change ça, ça vous dit ?`;
+    case "relance":
+      return `Bonjour, je reviens vers vous : ${constat}. Toujours partant pour en discuter 10 min cette semaine ?`;
+    case "pro":
+      return `Bonjour, je souhaitais vous signaler que ${constat}. Je serais disponible pour un échange de 10 minutes cette semaine, à votre convenance.`;
+  }
+}
+
+function appelFor(ton: Ton, constat: string): string {
+  const accroches: Record<Ton, string> = {
+    premier_contact: `Accroche : Bonjour, je vous contacte car ${constat}.`,
+    amical: `Accroche : Salut, je suis tombé sur votre fiche — ${constat} !`,
+    relance: `Accroche : Bonjour, je me permets de revenir vers vous car ${constat}.`,
+    pro: `Accroche : Bonjour, je vous contacte dans le cadre de mon activité : ${constat}.`,
+  };
+  const ctas: Record<Ton, string> = {
+    premier_contact: `Objectif de l'appel : décrocher 10 minutes pour montrer une solution concrète.`,
+    amical: `Objectif de l'appel : voir rapidement si ça peut l'intéresser, sans pression.`,
+    relance: `Objectif de l'appel : savoir où en est sa réflexion et relancer l'échange.`,
+    pro: `Objectif de l'appel : proposer un rendez-vous formel de présentation.`,
+  };
+  return `${accroches[ton]}\n${ctas[ton]}`;
+}
+
+function emailFor(ton: Ton, nom: string, constat: string): { objet: string; corps: string } {
+  switch (ton) {
+    case "premier_contact":
+      return {
+        objet: `Une question sur la visibilité de ${nom}`,
+        corps: `Bonjour,\n\nJe me permets de vous contacter : ${constat}.\n\nJe peux vous montrer en 10 minutes ce qu'une solution simple changerait concrètement. Un créneau cette semaine vous conviendrait ?\n\nBien à vous.`,
+      };
+    case "amical":
+      return {
+        objet: `${nom} — petite question`,
+        corps: `Salut,\n\nJe suis tombé sur votre fiche : ${constat}. Je pense pouvoir vous montrer un truc simple qui change ça.\n\nÇa vous dit qu'on en parle 10 min cette semaine ?\n\nÀ bientôt !`,
+      };
+    case "relance":
+      return {
+        objet: `${nom} — je reviens vers vous`,
+        corps: `Bonjour,\n\nJe me permets de revenir vers vous : ${constat}.\n\nToujours partant pour un échange rapide cette semaine ?\n\nMerci pour votre retour, quel qu'il soit.`,
+      };
+    case "pro":
+      return {
+        objet: `Proposition d'accompagnement — ${nom}`,
+        corps: `Bonjour,\n\nDans le cadre de mon activité, je souhaitais vous signaler que ${constat}.\n\nJe reste disponible pour un échange de 10 minutes cette semaine, à votre convenance.\n\nCordialement.`,
+      };
+  }
+}
+
+export function applyTon(angle: MessageAngle, ton: Ton, c: Company): MessageAngle {
+  const constat = constatFor(angle.id, c);
+  return {
+    ...angle,
+    appel: appelFor(ton, constat),
+    sms: smsFor(ton, constat),
+    email: emailFor(ton, c.name, constat),
+  };
+}
+
+export function tonLabel(ton: Ton): string {
+  if (ton === "premier_contact") return "Premier contact";
+  if (ton === "amical") return "Amical";
+  if (ton === "relance") return "Relance";
+  return "Pro";
+}

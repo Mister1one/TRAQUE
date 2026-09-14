@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Company } from "@/lib/supabase";
@@ -6,7 +6,10 @@ import {
   buildMessageAngles,
   canalLabel,
   messageText,
+  applyTon,
+  tonLabel,
   type Canal,
+  type Ton,
 } from "@/lib/prospection-messages";
 
 const STATUS_LABELS: Record<Company["status"], string> = {
@@ -22,9 +25,8 @@ const STATUS_LABELS: Record<Company["status"], string> = {
 };
 
 const CANAUX: Canal[] = ["appel", "sms", "email"];
+const TONS: Ton[] = ["premier_contact", "amical", "relance", "pro"];
 
-// Attendre une pause dans la frappe avant de sauvegarder, plutôt qu'un
-// appel réseau à chaque caractère.
 const SAVE_DELAY_MS = 800;
 
 export default function CompanyDetail({
@@ -41,23 +43,21 @@ export default function CompanyDetail({
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSavedCompanyId = useRef<string | null>(null);
 
-  // Angle et canal de message sélectionnés dans la fiche.
   const [angleIdx, setAngleIdx] = useState(0);
+  const [ton, setTon] = useState<Ton>("premier_contact");
   const [canal, setCanal] = useState<Canal>("appel");
   const [copied, setCopied] = useState(false);
 
-  // Calculé à la volée à partir des données du prospect : pas d'appel API,
-  // pas de stockage, régénéré à chaque changement de fiche sélectionnée.
   const angles = useMemo(
     () => (company ? buildMessageAngles(company) : []),
     [company]
   );
 
-  // Resynchronise le brouillon local quand on change de fiche sélectionnée.
   useEffect(() => {
     setNotes(company?.notes ?? "");
     setSaveState("idle");
     setAngleIdx(0);
+    setTon("premier_contact");
     setCanal("appel");
     setCopied(false);
   }, [company?.id]);
@@ -102,9 +102,6 @@ export default function CompanyDetail({
 
   function handleNotesBlur() {
     if (!company) return;
-    // Sauvegarde immédiate en quittant le champ, plutôt que d'attendre le
-    // délai normal — évite de perdre la dernière frappe si l'utilisateur
-    // clique ailleurs juste après avoir écrit.
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveNotes(company.id, notes);
   }
@@ -115,8 +112,7 @@ export default function CompanyDetail({
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // Presse-papier indisponible (permissions navigateur) : on ignore,
-      // le texte reste sélectionnable manuellement.
+      // ignore
     }
   }
 
@@ -133,7 +129,8 @@ export default function CompanyDetail({
     );
   }
 
-  const currentAngle = angles[angleIdx] ?? angles[0];
+  const rawAngle = angles[angleIdx] ?? angles[0];
+  const currentAngle = rawAngle ? applyTon(rawAngle, ton, company) : rawAngle;
   const currentText = currentAngle ? messageText(currentAngle, canal) : "";
 
   return (
@@ -179,12 +176,7 @@ export default function CompanyDetail({
               Site
             </dt>
             <dd>
-              <a
-                href={company.website}
-                target="_blank"
-                rel="noreferrer"
-                className="underline"
-              >
+              <a href={company.website} target="_blank" rel="noreferrer" className="underline">
                 {company.website}
               </a>
             </dd>
@@ -235,6 +227,23 @@ export default function CompanyDetail({
             ))}
           </div>
 
+          <div className="mb-2 flex flex-wrap gap-2">
+            {TONS.map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTon(t)}
+                className={`border px-2 py-1 font-mono text-[11px] uppercase tracking-wide ${
+                  ton === t
+                    ? "border-blaze bg-blaze/10 text-blaze"
+                    : "border-line text-text-ink/50 hover:text-text-ink"
+                }`}
+              >
+                {tonLabel(t)}
+              </button>
+            ))}
+          </div>
+
           <div className="mb-3 flex gap-4">
             {CANAUX.map((cnl) => (
               <button
@@ -274,7 +283,6 @@ export default function CompanyDetail({
           >
             Notes
           </label>
-          {/* Hauteur fixe pour ne pas décaler le champ en dessous. */}
           <span className="h-3 font-mono text-[10px] uppercase tracking-widest text-text-ink/35">
             {saveState === "saving" && "Enregistrement..."}
             {saveState === "saved" && "Enregistré"}
