@@ -58,7 +58,5 @@ export const config = {
   matcher: [
     "/dashboard/:path*",
     "/login",
-    "/api/scans",
-    "/api/scans/:path*",
   ],
 };

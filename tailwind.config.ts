@@ -8,16 +8,16 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        paper: "#E7E8E1",
-        ink: "#13161A",
+        paper: "rgb(var(--c-paper) / <alpha-value>)",
+        ink: "rgb(var(--c-ink) / <alpha-value>)",
         "ink-soft": "#1B1F24",
         blaze: "#FF4E1F",
         "blaze-dim": "#C93F19",
         forest: "#21362B",
         signal: "#8A9A6B",
-        "text-ink": "#1A1C19",
-        "text-paper": "#EDEEE7",
-        line: "rgba(26,28,25,0.12)",
+        "text-ink": "rgb(var(--c-text-ink) / <alpha-value>)",
+        "text-paper": "rgb(var(--c-text-paper) / <alpha-value>)",
+        line: "rgb(var(--c-text-ink) / 0.12)",
         "line-paper": "rgba(237,238,231,0.16)",
       },
       fontFamily: {
